@@ -18,6 +18,7 @@ theorem lbase_values (k b : ℤ) (h : lbase_spec k b) : b = lengthBases[k.toNat]
     have hk0 := h.1
     change 0 ≤ k at hk0
     obtain ⟨hk28, hb⟩ := h.2 hk0
+    replace hb := hb hk28
     by_cases hz : k = 0
     · subst k; simpa [lengthBases] using hb.1 rfl
     by_cases ht : k = 28
@@ -40,6 +41,7 @@ theorem dbase_values (k b : ℤ) (h : dbase_spec k b) : b = distanceBases[k.toNa
     have hk0 := h.1
     change 0 ≤ k at hk0
     obtain ⟨hk29, hb⟩ := h.2 hk0
+    replace hb := hb hk29
     by_cases hz : k = 0
     · subst k; simpa [distanceBases] using hb.1 rfl
     obtain ⟨a, ha, e, he, hbe⟩ := hb.2 hz

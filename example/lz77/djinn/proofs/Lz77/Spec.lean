@@ -13,6 +13,9 @@ open Aeneas Std Result
 set_option linter.unusedSimpArgs false
 set_option linter.unusedVariables false
 set_option linter.unusedTactic false
+set_option maxHeartbeats 1000000
+
+open scoped Classical
 
 deriving instance Inhabited for Lz77.spec.Token
 
@@ -26,9 +29,9 @@ def copies_pre (l : ℤ) (s : List U8) (j : ℤ) (d : ℤ) : Prop :=
 def copies_spec (l : ℤ) (s : List U8) (j : ℤ) (d : ℤ) (b : Bool) : Prop :=
   copies_pre l s j d ∧
   (((((0 ≤ l ∧ 1 ≤ d) ∧ d ≤ j) ∧ (j + l) ≤ (s.length : ℤ))) →
-  (b = true ↔ (l = 0 ∨ (¬(l = 0) → (s[j.toNat]! = s[(j - d).toNat]! ∧ (s[j.toNat]! = s[(j - d).toNat]! → copies_spec (l - 1) s (j + 1) d true))))))
-termination_by (l).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  (b = true ↔ (l = 0 ∨ (¬(l = 0) → (s[j.toNat]! = s[((j - d) : ℤ).toNat]! ∧ (s[j.toNat]! = s[((j - d) : ℤ).toNat]! → copies_spec (l - 1) s (j + 1) d true))))))
+termination_by (l : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel ismatch -/
 
@@ -56,9 +59,9 @@ def encoded_pre (ts : List Lz77.spec.Token) : Prop :=
 def encoded_spec (ts : List Lz77.spec.Token) (m : ℤ) : Prop :=
   encoded_pre ts ∧
   (True →
-  (((ts.length : ℤ) = 0 → m = 0) ∧ (¬((ts.length : ℤ) = 0) → (∃ v_call0 : ℤ, encoded_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) v_call0 ∧ (∃ v_call1 : U32, toklen_spec ts[((ts.length : ℤ) - 1).toNat]! v_call1 ∧ m = (v_call0 + (v_call1.val : ℤ)))))))
-termination_by ((ts.length : ℤ)).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre, ismatch_pre, ismatch_spec, toklen_pre, toklen_spec, encoded_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  (((ts.length : ℤ) = 0 → m = 0) ∧ (¬((ts.length : ℤ) = 0) → (∃ v_call0 : ℤ, encoded_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) v_call0 ∧ (∃ v_call1 : U32, toklen_spec ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! v_call1 ∧ m = (v_call0 + (v_call1.val : ℤ)))))))
+termination_by ((ts.length : ℤ) : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre, ismatch_pre, ismatch_spec, toklen_pre, toklen_spec, encoded_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel decode -/
 
@@ -68,9 +71,9 @@ def decode_pre (ts : List Lz77.spec.Token) : Prop :=
 def decode_spec (ts : List Lz77.spec.Token) (s : List U8) : Prop :=
   decode_pre ts ∧
   (True →
-  (((ts.length : ℤ) = 0 → (s.length : ℤ) = 0) ∧ (¬((ts.length : ℤ) = 0) → (∃ (p : List U8), (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) p ∧ (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ s[(p.length : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[(k - (dist_0.val : ℤ)).toNat]!))))))))
-termination_by ((ts.length : ℤ)).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre, ismatch_pre, ismatch_spec, toklen_pre, toklen_spec, encoded_pre, decode_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  (((ts.length : ℤ) = 0 → (s.length : ℤ) = 0) ∧ (¬((ts.length : ℤ) = 0) → (∃ (p : List U8), (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) p ∧ (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ s[((p.length : ℤ) : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[((k - (dist_0.val : ℤ)) : ℤ).toNat]!))))))))
+termination_by ((ts.length : ℤ) : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre, ismatch_pre, ismatch_spec, toklen_pre, toklen_spec, encoded_pre, decode_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel mincost -/
 
@@ -81,8 +84,8 @@ def mincost_spec (n : ℤ) (s : List U8) (k : ℤ) : Prop :=
   mincost_pre n s ∧
   (((0 ≤ n ∧ n ≤ (s.length : ℤ))) →
   ((n = 0 → k = 0) ∧ (¬(n = 0) → ((∃ v_call0 : ℤ, mincost_spec (n - 1) s v_call0 ∧ k ≤ (1 + v_call0)) ∧ ((∀ l : ℤ, 3 ≤ l → l < (258 + 1) → (∀ d : ℤ, 1 ≤ d → d < (32768 + 1) → (ismatch_spec s ((s.length : ℤ) - n) d l true → (∃ v_call1 : ℤ, mincost_spec (n - l) s v_call1 ∧ k ≤ (1 + v_call1))))) ∧ ((∃ v_call2 : ℤ, mincost_spec (n - 1) s v_call2 ∧ k = (1 + v_call2)) ∨ (∃ (l : ℤ) (d : ℤ), (ismatch_spec s ((s.length : ℤ) - n) d l true ∧ (ismatch_spec s ((s.length : ℤ) - n) d l true → (∃ v_call4 : ℤ, mincost_spec (n - l) s v_call4 ∧ k = (1 + v_call4)))))))))))
-termination_by (n).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre, ismatch_pre, ismatch_spec, toklen_pre, toklen_spec, encoded_pre, decode_pre, mincost_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+termination_by (n : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [copies_pre, ismatch_pre, ismatch_spec, toklen_pre, toklen_spec, encoded_pre, decode_pre, mincost_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel besttoken -/
 
@@ -91,7 +94,7 @@ def besttoken_pre (n : ℤ) (s : List U8) : Prop :=
 
 def besttoken_spec (n : ℤ) (s : List U8) (t : Lz77.spec.Token) : Prop :=
   besttoken_pre n s ∧
-  (match t with | .Lit ch_0 => (ch_0 = s[((s.length : ℤ) - n).toNat]! ∧ (∃ v_call0 : ℤ, mincost_spec (n - 1) s v_call0 ∧ mincost_spec n s (1 + v_call0)) ∧ (∀ l : ℤ, 3 ≤ l → l < (258 + 1) → (∀ d : ℤ, 1 ≤ d → d < (32768 + 1) → (ismatch_spec s ((s.length : ℤ) - n) d l true → (∃ v_call1 : ℤ, mincost_spec (n - l) s v_call1 ∧ (∃ v_call2 : ℤ, mincost_spec n s v_call2 ∧ (1 + v_call1) ≠ v_call2)))))) | .Match dist_0 len_1 => (ismatch_spec s ((s.length : ℤ) - n) (dist_0.val : ℤ) (len_1.val : ℤ) true ∧ (∃ v_call3 : ℤ, mincost_spec (n - (len_1.val : ℤ)) s v_call3 ∧ mincost_spec n s (1 + v_call3)) ∧ (∀ l : ℤ, ((len_1.val : ℤ) + 1) ≤ l → l < (258 + 1) → (∀ d : ℤ, 1 ≤ d → d < (32768 + 1) → (ismatch_spec s ((s.length : ℤ) - n) d l true → (∃ v_call4 : ℤ, mincost_spec (n - l) s v_call4 ∧ (∃ v_call5 : ℤ, mincost_spec n s v_call5 ∧ (1 + v_call4) ≠ v_call5))))) ∧ (∀ d : ℤ, 1 ≤ d → d < (dist_0.val : ℤ) → (ismatch_spec s ((s.length : ℤ) - n) d (len_1.val : ℤ) true → (∃ v_call6 : ℤ, mincost_spec (n - (len_1.val : ℤ)) s v_call6 ∧ (∃ v_call7 : ℤ, mincost_spec n s v_call7 ∧ (1 + v_call6) ≠ v_call7))))))
+  (match t with | .Lit ch_0 => (ch_0 = s[(((s.length : ℤ) - n) : ℤ).toNat]! ∧ (∃ v_call0 : ℤ, mincost_spec (n - 1) s v_call0 ∧ mincost_spec n s (1 + v_call0)) ∧ (∀ l : ℤ, 3 ≤ l → l < (258 + 1) → (∀ d : ℤ, 1 ≤ d → d < (32768 + 1) → (ismatch_spec s ((s.length : ℤ) - n) d l true → (∃ v_call1 : ℤ, mincost_spec (n - l) s v_call1 ∧ (∃ v_call2 : ℤ, mincost_spec n s v_call2 ∧ (1 + v_call1) ≠ v_call2)))))) | .Match dist_0 len_1 => (ismatch_spec s ((s.length : ℤ) - n) (dist_0.val : ℤ) (len_1.val : ℤ) true ∧ (∃ v_call3 : ℤ, mincost_spec (n - (len_1.val : ℤ)) s v_call3 ∧ mincost_spec n s (1 + v_call3)) ∧ (∀ l : ℤ, ((len_1.val : ℤ) + 1) ≤ l → l < (258 + 1) → (∀ d : ℤ, 1 ≤ d → d < (32768 + 1) → (ismatch_spec s ((s.length : ℤ) - n) d l true → (∃ v_call4 : ℤ, mincost_spec (n - l) s v_call4 ∧ (∃ v_call5 : ℤ, mincost_spec n s v_call5 ∧ (1 + v_call4) ≠ v_call5))))) ∧ (∀ d : ℤ, 1 ≤ d → d < (dist_0.val : ℤ) → (ismatch_spec s ((s.length : ℤ) - n) d (len_1.val : ℤ) true → (∃ v_call6 : ℤ, mincost_spec (n - (len_1.val : ℤ)) s v_call6 ∧ (∃ v_call7 : ℤ, mincost_spec n s v_call7 ∧ (1 + v_call6) ≠ v_call7))))))
 
 /-! ## func compress -/
 
@@ -101,6 +104,6 @@ def compress_pre (s : List U8) : Prop :=
 def compress_spec (s : List U8) (ts : List Lz77.spec.Token) : Prop :=
   compress_pre s ∧
   encoded_spec ts (s.length : ℤ) ∧
-  (∀ i : ℤ, 0 ≤ i → i < (ts.length : ℤ) → (∃ v_call0 : ℤ, encoded_spec ((ts.drop 0).take (i).toNat) v_call0 ∧ besttoken_spec ((s.length : ℤ) - v_call0) s ts[i.toNat]!))
+  (∀ i : ℤ, 0 ≤ i → i < (ts.length : ℤ) → (∃ v_call0 : ℤ, encoded_spec ((ts.drop 0).take i.toNat) v_call0 ∧ besttoken_spec ((s.length : ℤ) - v_call0) s ts[i.toNat]!))
 
 end Lz77.Spec

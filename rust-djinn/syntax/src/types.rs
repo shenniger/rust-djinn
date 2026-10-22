@@ -15,6 +15,53 @@ fn paren(s: String) -> String {
     }
 }
 
+/// Words Lean reserves (with Aeneas loaded): Aeneas's own list
+/// (`src/extract/LeanKeywords.ml`, generated from Lean's token table by
+/// `backends/lean/ExtractLeanKeywords.lean`), plus a few Djinn found itself.
+/// A Rust name that is one is written `«name»`.
+const LEAN_KEYWORDS: &[&str] = &[
+    "PiType", "Prop", "Sort", "StateRefT", "Type", "_", "abbrev", "add_aesop_rules", "add_decl_doc", "alias", "as", "assert!",
+    "assert_not_exists", "assert_not_imported", "assumeInstancesCommuteDummy", "at", "attribute", "axiom", "bif", "binder_predicate", "break", "builtin_cbv_simproc", "builtin_cbv_simproc_decl", "builtin_dsimproc",
+    "builtin_dsimproc_decl", "builtin_grind_propagator", "builtin_initialize", "builtin_simproc", "builtin_simproc_decl", "by", "by?", "by_elab", "calc", "catch", "cbv_eval", "cbv_simproc",
+    "cbv_simproc_decl", "class", "coinductive", "coinductive_fixpoint", "continue", "dbg_trace", "debug_assert!", "declare_aesop_rule_sets", "declare_bitwise_int_theorems", "declare_bitwise_uint_theorems", "declare_command_config_elab", "declare_command_config_elab_legacy",
+    "declare_config_elab", "declare_config_elab_legacy", "declare_core_config_elab", "declare_eval_bin", "declare_eval_bin_bitwise", "declare_eval_bin_bool_pred", "declare_int_theorems", "declare_option_config_elab", "declare_simp_like_tactic", "declare_sint_simprocs", "declare_syntax_cat", "declare_term_config_elab",
+    "declare_uint_simprocs", "declare_uint_theorems", "decreasing_by", "def", "def_eval_config_item", "def_wanted", "deprecate", "deprecated_module", "deprecated_syntax", "deriving", "do", "docs_to_verso",
+    "dsimproc", "dsimproc_decl", "elab", "elab_rules", "elab_stx_quot", "else", "end", "erase_aesop_rules", "eval_prec", "eval_prio", "example", "exists",
+    "export", "extend_docs", "extends", "f!", "finally", "for", "forall", "from", "fun", "generalizing", "grind_annotated", "grind_pattern",
+    "grind_propagator", "guard_min_heartbeats", "have", "haveI", "hiding", "idbg", "if", "impl_def", "import", "in", "include", "include_str",
+    "inductive", "inductive_fixpoint", "inferInstanceAs", "infix", "infixl", "infixr", "init_grind_norm", "init_quot", "initialize", "initialize_simps_projections", "initialize_simps_projections?", "insert_to_additive_translation",
+    "instance", "instance_wanted", "irreducible_def", "kerodon", "leading_parser", "lemma", "let", "letI", "let_delayed", "let_expr", "let_fun", "let_impl_detail",
+    "let_tmp", "library_note", "library_note2", "local", "logNamedError", "logNamedErrorAt", "logNamedWarning", "logNamedWarningAt", "m!", "macro", "macro_rules", "match",
+    "match_expr", "matches", "max_prec", "meta", "mk_iff_of_inductive_prop", "mod_cast", "mut", "mutual", "name", "namespace", "nat_lit", "no_index",
+    "nofun", "nomatch", "noncomputable", "nonrec", "norm_cast_add_elim", "notation", "notation3", "omit", "only", "opaque", "open", "panic!",
+    "partial", "partial_fixpoint", "postfix", "prefix", "print_decl", "println!", "private", "progress_array_spec", "proof_wanted", "protected", "public", "recommended_spelling",
+    "register_builtin_option", "register_error_explanation", "register_grind_attr", "register_hint", "register_label_attr", "register_linter_set", "register_option", "register_parser_alias", "register_simp_attr", "register_sym_dsimp", "register_sym_simp", "register_sym_simp_attr",
+    "register_tactic_tag", "register_try?_tactic", "renaming", "repeat", "reportDbgIssue!", "reportEMatchIssue!", "reportIssue!", "reprove", "return", "run_cmd", "run_elab", "run_meta",
+    "s!", "says", "scoped", "seal", "section", "set_library_suggestions", "set_option", "show", "show_panel_widgets", "show_term", "show_term_elab", "simproc",
+    "simproc_decl", "sorry", "stacks", "step_array_spec", "structure", "sudo", "suffices", "syntax", "tactic_alt", "tactic_extension", "tactic_name", "tactic_tag",
+    "termination_by", "termination_by?", "test_extern", "then", "theorem", "theorem_wanted", "throwError", "throwErrorAt", "throwNamedError", "throwNamedErrorAt", "to", "to_additive_name_hint",
+    "to_dual_insert_cast", "to_dual_insert_cast_fun", "to_dual_name_hint", "trailing_parser", "try", "unif_hint", "universe", "unless", "unlock_limits", "unreachable!", "unsafe", "unseal",
+    "unset_option", "until", "using", "using!", "variable", "variable?", "variables", "whatsnew", "where", "while", "with", "with_weak_namespace",
+    "without_expected_type",
+    // found by Djinn (identifiers Lean rejects with Aeneas and Mathlib loaded)
+    "name", "sorry", "only", "says", "generalizing", "lemma", "this", "public", "meta", "omit", "include",
+];
+
+/// A Rust identifier as a Lean identifier: Lean's keywords escaped.
+pub fn lean_ident(n: &str) -> String {
+    // a non-ASCII name (Rust allows `λ`, `π`, …) may be a Lean token: escaped too
+    if LEAN_KEYWORDS.contains(&n) || !n.is_ascii() {
+        format!("«{n}»")
+    } else {
+        n.to_string()
+    }
+}
+
+/// Field names a Lean structure cannot have: Lean defines these itself for
+/// every structure (the recursor and its kin), so Aeneas's translation of a
+/// struct with such a field does not compile.
+pub const RESERVED_FIELDS: &[&str] = &["rec", "recOn", "casesOn", "noConfusion", "noConfusionType", "mk", "below", "brecOn", "binductionOn", "ibelow", "ctorIdx", "toCtorIdx"];
+
 fn named(n: &str, names: &TypeNames) -> String {
     names.get(n).cloned().unwrap_or_else(|| n.to_string())
 }
@@ -67,7 +114,7 @@ pub fn view_of(var: &str, t: &RType) -> String {
         RType::Seq(_, SeqKind::String) => format!("(Djinn.Vocab.bytes {var})"),
         RType::Seq(e, _) if needs_view(e) => format!("({var}.val.map (fun y => {}))", view_term("y", e)),
         RType::Seq(..) => format!("{var}.val"),
-        RType::Map(..) => format!("{var}.entries"),
+        RType::Map(..) => view_term(var, t),
         RType::Result(..) if needs_view(t) => view_term(var, t),
         _ => var.to_string(),
     }
@@ -80,6 +127,8 @@ pub fn view_term(term: &str, t: &RType) -> String {
         RType::Seq(_, SeqKind::String) => format!("(Djinn.Vocab.bytes {term})"),
         RType::Seq(e, _) if needs_view(e) => format!("({term}.val.map (fun y => {}))", view_term("y", e)),
         RType::Seq(..) => format!("{term}.val"),
+        // the entries in their views (a `String` key is its bytes), as `view_type` says
+        RType::Map(k, v) if needs_view(k) || needs_view(v) => format!("({term}.entries.map (fun y => ({}, {})))", view_term("y.1", k), view_term("y.2", v)),
         RType::Map(..) => format!("{term}.entries"),
         RType::Option(e) if needs_view(e) => format!("({term}.map (fun y => {}))", view_term("y", e)),
         RType::Result(a, b) if needs_view(a) || needs_view(b) => format!(

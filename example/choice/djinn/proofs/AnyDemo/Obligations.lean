@@ -4,14 +4,17 @@
     Each theorem below is PINNED by its type and takes its proof from
     `AnyDemo.Proofs` by name. The implementer may prove it any way, with any
     helpers, but cannot weaken it: if the type does not match, this file fails
-    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem
-    here against {propext, Classical.choice, Quot.sound}. -/
+    to elaborate. `Audit.lean` then checks every theorem here, outside the
+    reach of `Proofs`: its statement against `Statements.lean`, its proof in
+    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/
 import AnyDemo.Spec
 import AnyDemo.Code.Funs
 import AnyDemo.Proofs
 
 open Aeneas Std
 open AnyDemo.Spec
+
+set_option maxHeartbeats 1000000
 
 namespace AnyDemo.Obligations
 
@@ -22,8 +25,8 @@ namespace AnyDemo.Obligations
     two outputs may differ only because a choice differs. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem checked_div.unambiguous :
-    ∀ (a : U32) (b : U32) (msg : U32 → U32 → List U8) (o₁ : core.result.Result U32 (List U8)) (o₂ : core.result.Result U32 (List U8)),
-      checked_div_body a b msg o₁ → checked_div_body a b msg o₂ → o₁ = o₂ :=
+    ∀ (a : U32) (b : U32) (msg : U32 → U32 → List U8) («o₁» : core.result.Result U32 (List U8)) («o₂» : core.result.Result U32 (List U8)),
+      checked_div_body a b msg «o₁» → checked_div_body a b msg «o₂» → o₁ = o₂ :=
   AnyDemo.Proofs.checked_div.unambiguous
 
 /-- GUARANTEE: well-formedness and call sites — every partial operation is in
@@ -60,8 +63,8 @@ theorem checked_div.exists :
     two outputs may differ only because a choice differs. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem safe_div.unambiguous :
-    ∀ (a : U32) (b : U32) (checked_div_msg : U32 → U32 → U32 → U32 → List U8) (checked_div_msg_1 : U32 → U32 → U32 → U32 → List U8) (o₁ : U32) (o₂ : U32),
-      safe_div_body a b checked_div_msg checked_div_msg_1 o₁ → safe_div_body a b checked_div_msg checked_div_msg_1 o₂ → o₁ = o₂ :=
+    ∀ (a : U32) (b : U32) (checked_div_msg : U32 → U32 → U32 → U32 → List U8) (checked_div_msg_1 : U32 → U32 → U32 → U32 → List U8) («o₁» : U32) («o₂» : U32),
+      safe_div_body a b checked_div_msg checked_div_msg_1 «o₁» → safe_div_body a b checked_div_msg checked_div_msg_1 «o₂» → o₁ = o₂ :=
   AnyDemo.Proofs.safe_div.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/
@@ -104,8 +107,8 @@ theorem safe_div.exists :
     two outputs may differ only because a choice differs. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem shrink.unambiguous :
-    ∀ (v : List U8) (w : (List U8) → ℤ → U8) (o₁ : List U8) (o₂ : List U8),
-      shrink_body v w o₁ → shrink_body v w o₂ → o₁ = o₂ :=
+    ∀ (v : List U8) (w : (List U8) → ℤ → U8) («o₁» : List U8) («o₂» : List U8),
+      shrink_body v w «o₁» → shrink_body v w «o₂» → o₁ = o₂ :=
   AnyDemo.Proofs.shrink.unambiguous
 
 /-- GUARANTEE: well-formedness and call sites — every partial operation is in
@@ -143,8 +146,8 @@ theorem shrink.exists :
     two outputs may differ only because a choice differs. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem pick.unambiguous :
-    ∀ (lo : I32) (hi : I32) (k : I32 → I32 → I32) (o₁ : I32) (o₂ : I32),
-      pick_body lo hi k o₁ → pick_body lo hi k o₂ → o₁ = o₂ :=
+    ∀ (lo : I32) (hi : I32) (k : I32 → I32 → I32) («o₁» : I32) («o₂» : I32),
+      pick_body lo hi k «o₁» → pick_body lo hi k «o₂» → o₁ = o₂ :=
   AnyDemo.Proofs.pick.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -173,8 +176,8 @@ theorem pick.exists :
     two outputs may differ only because a choice differs. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem pick_twice.unambiguous :
-    ∀ (lo : I32) (hi : I32) (pick_k : I32 → I32 → I32 → I32 → I32) (pick_k_1 : I32 → I32 → I32 → I32 → I32) (o₁ : I32) (o₂ : I32),
-      pick_twice_body lo hi pick_k pick_k_1 o₁ → pick_twice_body lo hi pick_k pick_k_1 o₂ → o₁ = o₂ :=
+    ∀ (lo : I32) (hi : I32) (pick_k : I32 → I32 → I32 → I32 → I32) (pick_k_1 : I32 → I32 → I32 → I32 → I32) («o₁» : I32) («o₂» : I32),
+      pick_twice_body lo hi pick_k pick_k_1 «o₁» → pick_twice_body lo hi pick_k pick_k_1 «o₂» → o₁ = o₂ :=
   AnyDemo.Proofs.pick_twice.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/

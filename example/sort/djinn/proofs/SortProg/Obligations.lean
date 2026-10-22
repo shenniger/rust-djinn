@@ -4,14 +4,17 @@
     Each theorem below is PINNED by its type and takes its proof from
     `SortProg.Proofs` by name. The implementer may prove it any way, with any
     helpers, but cannot weaken it: if the type does not match, this file fails
-    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem
-    here against {propext, Classical.choice, Quot.sound}. -/
+    to elaborate. `Audit.lean` then checks every theorem here, outside the
+    reach of `Proofs`: its statement against `Statements.lean`, its proof in
+    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/
 import SortProg.Spec
 import SortProg.Code.Funs
 import SortProg.Proofs
 
 open Aeneas Std
 open SortProg.Spec
+
+set_option maxHeartbeats 1000000
 
 namespace SortProg.Obligations
 
@@ -37,8 +40,8 @@ theorem permsuperset.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem sort.unambiguous :
-    ∀ (v_old : List I32) (o₁ : List I32) (o₂ : List I32),
-      sort_spec v_old o₁ → sort_spec v_old o₂ → o₁ = o₂ :=
+    ∀ (v_old : List I32) («o₁» : List I32) («o₂» : List I32),
+      sort_spec v_old «o₁» → sort_spec v_old «o₂» → o₁ = o₂ :=
   SortProg.Proofs.sort.unambiguous
 
 /-- GUARANTEE: well-formedness and call sites — every partial operation is in
@@ -74,8 +77,8 @@ theorem sort.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem max.unambiguous :
-    ∀ (list : List I32) (o₁ : I32) (o₂ : I32),
-      max_spec list o₁ → max_spec list o₂ → o₁ = o₂ :=
+    ∀ (list : List I32) («o₁» : I32) («o₂» : I32),
+      max_spec list «o₁» → max_spec list «o₂» → o₁ = o₂ :=
   SortProg.Proofs.max.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/

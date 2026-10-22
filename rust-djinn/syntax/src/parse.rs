@@ -553,9 +553,16 @@ fn parse_pattern(tts: &[TokenTree], span: Span) -> Result<Pattern> {
     if tts.len() == 1 && is_ident(&tts[0], "_") {
         return Ok(Pattern::Wild);
     }
-    // Enum :: Variant [ (…) | {…} ]
+    // Enum :: Variant [ (…) | {…} ]; `Some(x)`, `None`, `Ok(x)`, `Err(e)` are the
+    // variants of `Option` and `Result`
+    let builtin = |v: &str| match v {
+        "Some" | "None" => Some("Option"),
+        "Ok" | "Err" => Some("Result"),
+        _ => None,
+    };
     let (enum_name, variant, rest) = match tts {
         [TokenTree::Ident(e), TokenTree::Punct(a), TokenTree::Punct(b), TokenTree::Ident(v), rest @ ..] if a.as_char() == ':' && b.as_char() == ':' => (e.to_string(), v.to_string(), rest),
+        [TokenTree::Ident(v), rest @ ..] if builtin(&v.to_string()).is_some() => (builtin(&v.to_string()).unwrap().to_string(), v.to_string(), rest),
         _ => return Err(Error::new(span, "expected a pattern `Enum::Variant`, `Enum::Variant(a, _)`, `Enum::Variant { f, g: h, .. }` or `_`")),
     };
     let fields = match rest {
@@ -646,7 +653,12 @@ fn rewrite_in(tokens: TokenStream) -> TokenStream {
         .into_iter()
         .map(|t| match t {
             TokenTree::Group(g) => {
-                let mut ng = Group::new(g.delimiter(), rewrite_in(g.stream()));
+                // inside parentheses `=>` can only be an implication (statement-level `=>` and
+                // `match` arms are never parenthesized): `!(A) || (B)`, which syn parses; in
+                // each argument of a call (`g(a => b, c)`) and in a closure's body
+                // (`all(|x| a => b)`)
+                let inner = if g.delimiter() == Delimiter::Parenthesis { rewrite_implies_args(g.stream()) } else { g.stream() };
+                let mut ng = Group::new(g.delimiter(), rewrite_in(inner));
                 ng.set_span(g.span());
                 TokenTree::Group(ng)
             }
@@ -665,7 +677,8 @@ fn rewrite_in(tokens: TokenStream) -> TokenStream {
         let is_andor = two
             && matches!(&tts[i], TokenTree::Punct(p) if (p.as_char() == '&' || p.as_char() == '|') && p.spacing() == Spacing::Joint)
             && matches!((&tts[i], &tts[i+1]), (TokenTree::Punct(a), TokenTree::Punct(b)) if a.as_char() == b.as_char());
-        let is_boundary = is_ident(&tts[i], "if") || is_ident(&tts[i], "else") || is_brace(&tts[i]).is_some();
+        // a comma separates call arguments: `f(a > 0, b > 0)` is two comparisons, not a chain
+        let is_boundary = is_ident(&tts[i], "if") || is_ident(&tts[i], "else") || is_brace(&tts[i]).is_some() || is_punct(&tts[i], ',');
         if is_andor {
             flush(&mut seg, &mut out);
             out.push(tts[i].clone());
@@ -682,6 +695,60 @@ fn rewrite_in(tokens: TokenStream) -> TokenStream {
     }
     flush(&mut seg, &mut out);
     out.into_iter().collect()
+}
+
+/// `rewrite_implies` on each comma-separated part of a parenthesized group (the
+/// arguments of a call, the elements of a tuple), and on the body of a part that
+/// is a closure `|x| body` (whose body extends to the end of the part).
+fn rewrite_implies_args(tokens: TokenStream) -> TokenStream {
+    let tts: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut out: Vec<TokenTree> = Vec::new();
+    let mut rest = &tts[..];
+    loop {
+        let end = rest.iter().position(|t| is_punct(t, ',')).unwrap_or(rest.len());
+        let part = &rest[..end];
+        // a closure's parameters `|…|` (or `move |…|`, `||`) stay; its body is rewritten
+        let start = usize::from(part.first().is_some_and(|t| is_ident(t, "move")));
+        let body_at = match (part.get(start), part.get(start + 1)) {
+            (Some(a), Some(b)) if is_punct(a, '|') && is_punct(b, '|') => start + 2,
+            (Some(a), _) if is_punct(a, '|') => part.iter().skip(start + 1).position(|t| is_punct(t, '|')).map(|j| start + j + 2).unwrap_or(0),
+            _ => 0,
+        };
+        out.extend(part[..body_at].iter().cloned());
+        out.extend(rewrite_implies(part[body_at..].iter().cloned().collect()));
+        if end == rest.len() {
+            break;
+        }
+        out.push(rest[end].clone());
+        rest = &rest[end + 1..];
+    }
+    out.into_iter().collect()
+}
+
+/// `A => B` (right-associative, below `||`) as `!(A) || (B)`, at the top level of `tokens`;
+/// unchanged without a top-level `=>`.
+fn rewrite_implies(tokens: TokenStream) -> TokenStream {
+    let tts: Vec<TokenTree> = tokens.into_iter().collect();
+    let Some(i) = (0..tts.len()).find(|&i| is_fat_arrow(&tts, i)) else { return tts.into_iter().collect() };
+    let span = tts[i].span();
+    let lhs: TokenStream = tts[..i].iter().cloned().collect();
+    let rhs = rewrite_implies(tts[i + 2..].iter().cloned().collect());
+    let mut out = TokenStream::new();
+    let mut bang = Punct::new('!', Spacing::Alone);
+    bang.set_span(span);
+    out.extend([TokenTree::Punct(bang)]);
+    let mut gl = Group::new(Delimiter::Parenthesis, lhs);
+    gl.set_span(span);
+    out.extend([TokenTree::Group(gl)]);
+    let mut o1 = Punct::new('|', Spacing::Joint);
+    o1.set_span(span);
+    let mut o2 = Punct::new('|', Spacing::Alone);
+    o2.set_span(span);
+    out.extend([TokenTree::Punct(o1), TokenTree::Punct(o2)]);
+    let mut gr = Group::new(Delimiter::Parenthesis, rhs);
+    gr.set_span(span);
+    out.extend([TokenTree::Group(gr)]);
+    out
 }
 
 /// Comparison operators at the top level of a segment: (start index, width).
@@ -707,6 +774,11 @@ fn cmp_ops(seg: &[TokenTree]) -> Vec<(usize, usize)> {
                     continue;
                 }
                 ('=', true, Some('>')) => {
+                    i += 2;
+                    continue;
+                }
+                // `<<` and `>>` are shifts, not two comparisons
+                ('<', true, Some('<')) | ('>', true, Some('>')) => {
                     i += 2;
                     continue;
                 }
@@ -780,6 +852,43 @@ fn rewrite_in_segment(seg: Vec<TokenTree>) -> Vec<TokenTree> {
 }
 
 /// `Enum::Variant` from a two-segment path (the variant capitalized).
+/// `u32::MAX`, `i8::MIN`, `u16::BITS`, `usize::MAX`, …: a literal for a
+/// fixed width; `usize::MAX`, `isize::MAX` and `isize::MIN` stay symbolic
+/// (Aeneas leaves the width of `usize` open).
+fn int_const(p: &syn::Path, span: proc_macro2::Span) -> Option<ExprKind> {
+    if p.segments.len() != 2 || p.segments.iter().any(|s| !s.arguments.is_empty()) {
+        return None;
+    }
+    let (signed, bits): (bool, u32) = match p.segments[0].ident.to_string().as_str() {
+        "u8" => (false, 8),
+        "u16" => (false, 16),
+        "u32" => (false, 32),
+        "u64" => (false, 64),
+        "u128" => (false, 128),
+        "usize" => (false, 0),
+        "i8" => (true, 8),
+        "i16" => (true, 16),
+        "i32" => (true, 32),
+        "i64" => (true, 64),
+        "i128" => (true, 128),
+        "isize" => (true, 0),
+        _ => return None,
+    };
+    let lit = |v: u128| ExprKind::Int(v.to_string());
+    let pow = |k: u32| if k == 128 { u128::MAX } else { (1u128 << k) - 1 };
+    Some(match (p.segments[1].ident.to_string().as_str(), bits) {
+        ("MAX", 0) => ExprKind::Method(Box::new(Method::SizeBound { signed, max: true })),
+        ("MIN", 0) if signed => ExprKind::Method(Box::new(Method::SizeBound { signed, max: false })),
+        ("MIN", _) if !signed => lit(0),
+        ("MAX", b) if signed => lit(pow(b - 1)),
+        ("MAX", b) => lit(pow(b)),
+        ("MIN", b) => ExprKind::Neg(Box::new(Expr::new(span, lit(pow(b - 1) + 1)))),
+        ("BITS", b) if b > 0 => lit(b as u128),
+        ("BITS", _) => ExprKind::Method(Box::new(Method::SizeBits)),
+        _ => return None,
+    })
+}
+
 fn variant_path(p: &syn::Path) -> Option<(String, String)> {
     if p.segments.len() == 2 && p.segments.iter().all(|s| s.arguments.is_empty()) {
         let e = p.segments[0].ident.to_string();
@@ -808,6 +917,9 @@ fn convert_expr(e: &syn::Expr) -> Result<Expr> {
             _ => err("only integer, boolean, char and string literals are supported"),
         },
         S::Path(p) => {
+            if let Some(k) = int_const(&p.path, span) {
+                return mk(k);
+            }
             if let Some((en, v)) = variant_path(&p.path) {
                 return mk(ExprKind::Variant { enum_name: en, variant: v, fields: vec![] });
             }
@@ -848,7 +960,12 @@ fn convert_expr(e: &syn::Expr) -> Result<Expr> {
                 syn::BinOp::Ge(_) => BinOp::Ge,
                 syn::BinOp::And(_) => BinOp::And,
                 syn::BinOp::Or(_) => BinOp::Or,
-                _ => return err("unsupported binary operator (assignment and bit operators are not constraints)"),
+                syn::BinOp::BitAnd(_) => BinOp::BitAnd,
+                syn::BinOp::BitOr(_) => BinOp::BitOr,
+                syn::BinOp::BitXor(_) => BinOp::BitXor,
+                syn::BinOp::Shl(_) => BinOp::Shl,
+                syn::BinOp::Shr(_) => BinOp::Shr,
+                _ => return err("unsupported binary operator (assignments are not constraints)"),
             };
             let l = convert_expr(&b.left)?;
             let r = convert_expr(&b.right)?;
@@ -1024,7 +1141,7 @@ fn closure_param(c: &syn::ExprClosure) -> Result<String> {
 }
 
 /// The vocabulary, for messages.
-const VOCABULARY: &str = "`s.len()`, `s.is_empty()`, `s.contains(&x)`, `s.iter().filter(|y| p).count()`, `s.iter().all(|y| p)`, `s.iter().any(|y| p)`, `s.iter().sum()`, `s.first()`, `s.last()`, `s.windows(2).all(|w| p)`, `s.as_bytes()`, `x.abs()`, `x.pow(n)`, `a.min(b)`, `a.max(b)`, `o.is_some()`, `o.is_none()`, `o.unwrap()`";
+const VOCABULARY: &str = "`s.len()`, `s.is_empty()`, `s.contains(&x)`, `s.iter().filter(|y| p).count()`, `s.iter().all(|y| p)`, `s.iter().any(|y| p)`, `s.iter().sum()`, `s.first()`, `s.last()`, `s.windows(2).all(|w| p)`, `s.as_bytes()`, `x.abs()`, `x.pow(n)`, `a.min(b)`, `a.max(b)`, `o.is_some()`, `o.is_none()`, `o.unwrap()`, `x.count_ones()` (and `count_zeros`, `leading_zeros`, `leading_ones`, `trailing_zeros`, `trailing_ones`), `x.rotate_left(n)`, `x.rotate_right(n)`, `x.wrapping_add(y)` (and `wrapping_sub`, `wrapping_mul`)";
 
 /// Why a method is not in the vocabulary, when the reason is a common one.
 fn method_hint(name: &str) -> String {
@@ -1032,7 +1149,7 @@ fn method_hint(name: &str) -> String {
         "push" | "pop" | "insert" | "remove" | "clear" | "sort" | "sort_unstable" | "swap" | "truncate" | "extend" | "retain" | "dedup" | "reverse" | "push_str" | "append" | "drain" | "resize" | "fill" => {
             format!("`.{name}()` mutates its receiver, and a specification describes values, not steps: relate the output to the input instead (`v.len() == old(v).len() + 1`, `v[old(v).len()] == x`, …). The vocabulary: {VOCABULARY}")
         }
-        "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "checked_add" | "checked_sub" | "checked_mul" | "saturating_add" | "saturating_sub" | "overflowing_add" | "rem_euclid" | "div_euclid" => {
+        "checked_add" | "checked_sub" | "checked_mul" | "saturating_add" | "saturating_sub" | "overflowing_add" | "rem_euclid" | "div_euclid" => {
             format!("`.{name}()` speaks about machine overflow, but specification integers are unbounded: write the plain arithmetic (`x + 1`); `/` and `%` are already Euclidean")
         }
         "map" | "fold" | "collect" | "zip" | "enumerate" | "rev" | "skip" | "take" | "chain" | "flat_map" | "position" | "find" | "max" | "min" | "max_by_key" | "min_by_key" | "cloned" | "copied" => {
@@ -1123,6 +1240,12 @@ fn convert_method(m: &syn::ExprMethodCall) -> Result<Expr> {
         "as_bytes" => Method::AsBytes(recv),
         "get" => Method::MapGet(recv, arg(0)?),
         "contains_key" => Method::ContainsKey(recv, arg(0)?),
+        "rotate_left" => Method::Rotate(true, recv, arg(0)?),
+        "rotate_right" => Method::Rotate(false, recv, arg(0)?),
+        "wrapping_add" => Method::Wrapping(BinOp::Add, recv, arg(0)?),
+        "wrapping_sub" => Method::Wrapping(BinOp::Sub, recv, arg(0)?),
+        "wrapping_mul" => Method::Wrapping(BinOp::Mul, recv, arg(0)?),
+        n if BitCount::from_name(n).is_some() => Method::BitCount(BitCount::from_name(n).unwrap(), recv),
         "iter" => return err("`.iter()` must be followed by `.all(..)`, `.any(..)`, `.sum()` or `.filter(..).count()`".into()),
         _ => return err(method_hint(&name)),
     })
@@ -1138,6 +1261,36 @@ fn ambient_type_ok(t: &RType) -> bool {
         RType::Option(e) => ambient_type_ok(e),
         RType::Result(a, b) => ambient_type_ok(a) && ambient_type_ok(b),
         RType::MathInt | RType::Seq(..) | RType::Map(..) => false,
+    }
+}
+
+/// The elements of an array literal of integers (`&[1, -2, 0x3]`, `[7u16; 0]`
+/// is not one: repeat expressions are not tables), in decimal; `None` for any
+/// other expression. Element types and ranges are rustc's to check: the
+/// specification file is compiled like any other module.
+fn table_literal(e: &syn::Expr) -> Option<Vec<String>> {
+    fn elem(e: &syn::Expr) -> Option<String> {
+        match e {
+            syn::Expr::Lit(l) => match &l.lit {
+                syn::Lit::Int(i) => Some(i.base10_digits().to_string()),
+                syn::Lit::Byte(b) => Some(b.value().to_string()),
+                _ => None,
+            },
+            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => {
+                let v = elem(&u.expr)?;
+                Some(if v == "0" { v } else if let Some(p) = v.strip_prefix('-') { p.to_string() } else { format!("-{v}") })
+            }
+            syn::Expr::Paren(p) => elem(&p.expr),
+            syn::Expr::Group(g) => elem(&g.expr),
+            _ => None,
+        }
+    }
+    match e {
+        syn::Expr::Reference(r) => table_literal(&r.expr),
+        syn::Expr::Paren(p) => table_literal(&p.expr),
+        syn::Expr::Group(g) => table_literal(&g.expr),
+        syn::Expr::Array(a) => a.elems.iter().map(elem).collect(),
+        _ => None,
     }
 }
 
@@ -1169,6 +1322,15 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                     syn::Fields::Named(n) => n.named.iter().map(|f| convert_type(&f.ty).map(|(t, _)| (f.ident.as_ref().map(|i| i.to_string()).unwrap_or_default(), t))).collect::<Result<Vec<_>>>()?,
                     _ => return Err(Error::new(s.ident.span(), "only structs with named fields are supported in specifications")),
                 };
+                if let syn::Fields::Named(n) = &s.fields {
+                    for f in &n.named {
+                        if let Some(id) = &f.ident {
+                            if crate::types::RESERVED_FIELDS.contains(&id.to_string().as_str()) {
+                                return Err(Error::new(id.span(), format!("a field cannot be named `{id}`: Lean defines `{}.{id}` for every structure itself (its recursor and kin), so the Aeneas translation would not compile; rename the field", s.ident)));
+                            }
+                        }
+                    }
+                }
                 t.structs.insert(s.ident.to_string(), StructDef { name: s.ident.to_string(), fields });
             }
             syn::Item::Fn(f) => {
@@ -1227,13 +1389,25 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                 }
             }
             syn::Item::Const(c) => {
+                // an array of integer literals is a table: `Spec.lean` defines it once
+                if let Some(elems) = table_literal(&c.expr) {
+                    // a table is `&[T]` or `[T; N]` of an integer type; any other
+                    // array constant is not usable in specifications, as before
+                    let ty = match convert_type(&c.ty) {
+                        Ok((ty @ RType::Seq(_, SeqKind::Slice | SeqKind::Array(_)), _)) if matches!(&ty, RType::Seq(e, _) if matches!(**e, RType::Int { .. })) => ty,
+                        _ => continue,
+                    };
+                    let value = Expr::new(c.ident.span(), ExprKind::Var(c.ident.to_string()));
+                    t.consts.insert(c.ident.to_string(), Const { name: c.ident.to_string(), ty, value, table: Some(elems) });
+                    continue;
+                }
                 // only literal constants (optionally negated) are usable in specifications
                 let value = match convert_expr(&c.expr) {
                     Ok(v) if matches!(v.kind, ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Char(_) | ExprKind::Str(_)) || matches!(&v.kind, ExprKind::Neg(x) if matches!(x.kind, ExprKind::Int(_))) => v,
                     _ => continue,
                 };
                 let (ty, _) = convert_type(&c.ty)?;
-                t.consts.insert(c.ident.to_string(), Const { name: c.ident.to_string(), ty, value });
+                t.consts.insert(c.ident.to_string(), Const { name: c.ident.to_string(), ty, value, table: None });
             }
             _ => {}
         }

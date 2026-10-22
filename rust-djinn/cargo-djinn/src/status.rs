@@ -138,6 +138,9 @@ pub struct Usage {
     pub est_approx: bool,
     pub model: Option<String>,
     pub last_message: String,
+    /// The API error a Claude run ended on (a usage limit, say): the text of
+    /// the last `result` that carried `api_error` or `is_error`.
+    pub api_error: Option<String>,
     /// The agent reached the end of its turn (Claude's `result`, Codex's
     /// `turn.completed`); false for a log cut short by a signal or a crash.
     pub ended_turn: bool,
@@ -186,6 +189,9 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
             if let Some(m) = v["model"].as_str() {
                 u.model = Some(m.to_string());
             }
+            // a new run (a resumed session appends to the same log): an
+            // earlier run's API error is history
+            u.api_error = None;
         }
         if v["type"] == "assistant" {
             if let Some(m) = v["message"]["model"].as_str() {
@@ -214,21 +220,36 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
         if v["type"] == "result" {
             u.ended_turn = true;
             have_result = true;
-            if let Some(t) = v["result"].as_str() {
-                *last = t.to_string();
+            // a run can end on several results (one per background task that
+            // finished late): an empty one must not hide the text, the error or
+            // the usage of an earlier one
+            let text = v["result"].as_str().unwrap_or("");
+            if !text.is_empty() {
+                *last = text.to_string();
+            }
+            if (!v["api_error"].is_null() || v["is_error"] == true) && !text.is_empty() {
+                u.api_error = Some(text.to_string());
+            } else if !text.is_empty() {
+                // a later result that succeeded: the run recovered
+                u.api_error = None;
             }
             if let Some(c) = v["total_cost_usd"].as_f64() {
-                u.cost_usd = Some(c);
+                if c > 0.0 || u.cost_usd.is_none() {
+                    u.cost_usd = Some(c);
+                }
             }
             if let Some(n) = v["num_turns"].as_u64() {
-                u.turns = n as usize;
+                if n > 0 {
+                    u.turns = n as usize;
+                }
             }
             let us = &v["usage"];
-            u.input_tokens = us["input_tokens"].as_u64().unwrap_or(0)
-                + us["cache_read_input_tokens"].as_u64().unwrap_or(0)
-                + us["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            u.cached_tokens = us["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            u.output_tokens = us["output_tokens"].as_u64().unwrap_or(0);
+            let input = us["input_tokens"].as_u64().unwrap_or(0) + us["cache_read_input_tokens"].as_u64().unwrap_or(0) + us["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            if input > 0 {
+                u.input_tokens = input;
+                u.cached_tokens = us["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                u.output_tokens = us["output_tokens"].as_u64().unwrap_or(0);
+            }
         }
         // Codex JSONL
         if v["type"] == "item.completed" || v["type"] == "item.started" {
@@ -609,6 +630,27 @@ pub fn render(views: &[DeclView]) -> String {
     s
 }
 
+/// A report's verdict as `cargo djinn verify` prints it: `PASS`, `FAIL`, or —
+/// every obligation proved but some `fn` without an implementation, which the
+/// build gate still refuses — `SPECIFICATION VERIFIED`.
+pub fn verdict(r: &Report) -> String {
+    let missing = r.unimplemented();
+    if !r.pass {
+        "FAIL".into()
+    } else if missing.is_empty() {
+        "PASS".into()
+    } else {
+        format!("SPECIFICATION VERIFIED (not implemented yet: {})", missing.join(", "))
+    }
+}
+
+/// The solution and proof files on disk against the report's fingerprint
+/// (what the build gate checks).
+pub fn evidence_check(cfg: &Config, r: &Report) -> djinn_syntax::project::EvidenceCheck {
+    let current = djinn_syntax::project::evidence(&cfg.crate_dir, &cfg.solution_dir(), &cfg.proofs, &cfg.ns);
+    djinn_syntax::project::check_evidence(&r.evidence, &current)
+}
+
 pub fn status_text(cfg: &Config) -> String {
     let mut s = String::new();
     let report = Report::load(cfg);
@@ -618,11 +660,14 @@ pub fn status_text(cfg: &Config) -> String {
         Some(r) => {
             s.push_str(&format!(
                 "verified state — last verify {} at {} UTC ({} s){}:\n",
-                if r.pass { "PASS" } else { "FAIL" },
+                verdict(r),
                 fmt_time(r.time),
                 r.duration_secs,
                 if r.pass { String::new() } else { format!(", stage: {}", r.stage) }
             ));
+            if let Some(m) = evidence_check(cfg, r).message() {
+                s.push_str(&format!("  {m}\n"));
+            }
             s.push_str(&render(&views(cfg, Some(r), None)));
             for e in r.errors.iter().take(6) {
                 s.push_str(&format!("    {e}\n"));
@@ -735,4 +780,39 @@ pub fn diff_views(old: &[DeclView], new: &[DeclView]) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_cleared_by_a_later_run() {
+        let dir = std::env::temp_dir().join(format!("djinn-status-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        let failed = r#"{"type":"system","subtype":"init","model":"claude-x"}
+{"type":"result","result":"usage limit reached","is_error":true}"#;
+        fs::write(&log, failed).unwrap();
+        assert_eq!(summarize_log(&log, None).api_error.as_deref(), Some("usage limit reached"));
+        // resumed in the same log and finished
+        fs::write(&log, format!("{failed}\n{}", r#"{"type":"system","subtype":"init","model":"claude-x"}
+{"type":"result","result":"done","is_error":false}"#)).unwrap();
+        assert_eq!(summarize_log(&log, None).api_error, None);
+        // an empty late result keeps the error
+        fs::write(&log, format!("{failed}\n{}", r#"{"type":"result","result":""}"#)).unwrap();
+        assert_eq!(summarize_log(&log, None).api_error.as_deref(), Some("usage limit reached"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spec_only_verdict() {
+        let d = |name: &str, implemented: bool| crate::verify::DeclStatus { name: name.into(), kind: "func".into(), implemented, obligations: vec![], tokens: String::new(), uses: vec![], ok: implemented, weak: false };
+        let mut r = Report { time: 0, duration_secs: 0, pass: true, stage: "done".into(), obligations: Default::default(), declarations: vec![d("f", true), d("g", false)], errors: vec![], log_tail: vec![], evidence: String::new() };
+        assert_eq!(verdict(&r), "SPECIFICATION VERIFIED (not implemented yet: g)");
+        r.declarations.pop();
+        assert_eq!(verdict(&r), "PASS");
+        r.pass = false;
+        assert_eq!(verdict(&r), "FAIL");
+    }
 }

@@ -35,7 +35,7 @@ def solution.checked_div
   then
     let s ←
       alloc.string.String.Insts.CoreConvertFromShared0Str.from (toStr
-        "division by zero")
+        "division by zero" (by rw [show Aeneas.Std.U32.max = 4294967295 by scalar_tac]; decide +kernel))
     ok (core.result.Result.Err s)
   else let i ← a / b
        ok (core.result.Result.Ok i)

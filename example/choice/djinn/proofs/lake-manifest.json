@@ -7,7 +7,7 @@
    "manifestFile": "lake-manifest.json",
    "inherited": false,
    "dir":
-   "/Users/simon/claude/speclang/dafny/aeneas/tools/aeneas/backends/lean",
+   "../../../../tools/aeneas/backends/lean",
    "configFile": "lakefile.lean"},
   {"url": "https://github.com/leanprover-community/mathlib4.git",
    "type": "git",

@@ -34,7 +34,7 @@ theorem lbase_correct (i : ℕ) (hi : i < 29) : lbase_spec i (lb i) := by
       norm_num [lbase_pre, lb, LENGTH_BASE, Array.make]
   | succ i ih =>
       rw [lbase_spec]
-      refine ⟨by unfold lbase_pre; omega, fun _ => ⟨by omega, fun hz => by omega, fun _ => ?_⟩⟩
+      refine ⟨by unfold lbase_pre; omega, fun _ => ⟨by omega, fun _ => ⟨fun hz => by omega, fun _ => ?_⟩⟩⟩
       by_cases hlast : i + 1 = 28
       · constructor
         · intro _
@@ -57,7 +57,7 @@ theorem dbase_correct (i : ℕ) (hi : i < 30) : dbase_spec i (db i) := by
       norm_num [dbase_pre, db, DIST_BASE, Array.make]
   | succ i ih =>
       rw [dbase_spec]
-      refine ⟨by unfold dbase_pre; omega, fun _ => ⟨by omega, fun hz => by omega, fun _ => ?_⟩⟩
+      refine ⟨by unfold dbase_pre; omega, fun _ => ⟨by omega, fun _ => ⟨fun hz => by omega, fun _ => ?_⟩⟩⟩
       have hidx : ((i + 1 : ℕ) : ℤ) - 1 = i := by omega
       rw [hidx]
       refine ⟨db i, ih (by omega), de i, dextra_correct i (by omega), ?_⟩

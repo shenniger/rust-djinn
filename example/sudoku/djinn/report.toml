@@ -1,15 +1,26 @@
 # Written by `cargo djinn` after every verify. Per declaration: its tokens as
 # verified, what it uses, and the status of each obligation. The `djinn!`
 # macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
-# used declaration's) differ from this file. Commit it with solution/ and proofs/.
+# used declaration's) differ from this file, and the whole crate when the
+# solution or proof files differ from `run.evidence` (edit them, verify again).
+# Commit it with solution/ and proofs/.
 
 [run]
-time = "2026-10-13 03:53:32 UTC"
-unix_time = 1791863612
-duration_secs = 18
+time = "2026-10-22 04:50:38 UTC"
+unix_time = 1792644638
+duration_secs = 33
 pass = true
 stage = "done"
 errors = []
+evidence = """
+fnv1a64v2:a0d0c5c098930362:7
+977293d3166f2f15 djinn/proofs/Sudoku.lean
+f1ac132c23ac9230 djinn/proofs/Sudoku/Proofs.lean
+713a4b883bd5d8d2 djinn/proofs/Sudoku/Proofs/Solver.lean
+125256cd9d7becc7 djinn/proofs/lake-manifest.json
+7a561004cacfed12 djinn/proofs/lakefile.lean
+8e8349acb539bb60 djinn/proofs/lean-toolchain
+262d805a7c4a28bb djinn/solution/mod.rs"""
 
 [[decl]]
 name = "sameunit"

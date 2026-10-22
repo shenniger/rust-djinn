@@ -249,6 +249,47 @@ fn imp(a: &str, b: &str) -> String {
     }
 }
 
+/// The SMT term for a bit count of the `w`-bit vector `bv`.
+fn bit_count_smt(k: BitCount, bv: &str, w: u32) -> String {
+    let bit = |v: &str, i: u32| format!("((_ extract {i} {i}) {v})");
+    let inv = format!("(bvnot {bv})");
+    let ones = |v: &str| format!("(+ {})", (0..w).map(|i| format!("(bv2nat {})", bit(v, i))).collect::<Vec<_>>().join(" "));
+    // the index of the first 1 bit in `order`, or `w`
+    let first = |v: &str, order: Vec<u32>| {
+        let mut t = w.to_string();
+        for (pos, i) in order.iter().enumerate().rev() {
+            t = format!("(ite (= {} #b1) {pos} {t})", bit(v, *i));
+        }
+        t
+    };
+    match k {
+        BitCount::CountOnes => ones(bv),
+        BitCount::CountZeros => ones(&inv),
+        BitCount::TrailingZeros => first(bv, (0..w).collect()),
+        BitCount::TrailingOnes => first(&inv, (0..w).collect()),
+        BitCount::LeadingZeros => first(bv, (0..w).rev().collect()),
+        BitCount::LeadingOnes => first(&inv, (0..w).rev().collect()),
+    }
+}
+
+/// A `w`-bit pattern given as a natural number, read in two's complement.
+fn to_signed(t: &str, w: u32) -> String {
+    let half = 1i128 << (w - 1).min(126);
+    format!("(let ((u {t})) (ite (>= u {half}) (- u {}) u))", half * 2)
+}
+
+/// Tables longer than this are not expanded (every symbolic index into one
+/// becomes a chain of that many cases).
+const TABLE_LIMIT: usize = 4096;
+
+/// A decimal integer as an SMT-LIB term.
+fn smt_int(x: &str) -> String {
+    match x.strip_prefix('-') {
+        Some(p) => format!("(- {p})"),
+        None => x.to_string(),
+    }
+}
+
 fn arith(op: &str, a: &IntT, b: &IntT) -> IntT {
     if let (Some(x), Some(y)) = (a.lit(), b.lit()) {
         let r = match op {
@@ -309,6 +350,13 @@ struct Lo<'a> {
     bounds: &'a Bounds,
     small: bool,
     env: HashMap<String, Val>,
+    /// The Rust types of the declaration's parameters and outputs in scope
+    /// (binders shadow them): the width of `x.count_ones()` and kin.
+    vtypes: HashMap<String, RType>,
+    /// Integer terms that are `(bv2nat B)` of a `w`-bit vector `B` built
+    /// here: bit operations reuse `B` instead of converting back (Z3 times
+    /// out on chains of `int2bv`/`bv2nat`, and is fast on bit vectors).
+    bvs: HashMap<String, (String, u32)>,
     /// `v` → `v_old` while lowering a `requires`
     pre_scope: bool,
     muts: Vec<String>,
@@ -319,6 +367,12 @@ struct Lo<'a> {
     /// well-formedness violations: (formula, description); a violation under a
     /// quantifier is existential in the quantifier's variables
     wf: Vec<(String, String)>,
+    /// where the encoding stops being exact (a shift too far for it): the
+    /// same shape as `wf`, but not obligations of the specification — Lean's
+    /// shifts have no limit. Every query assumes none is reached (so what it
+    /// finds is genuine), and a declaration that can reach one gets no
+    /// "nothing found" verdict (see `Check::Limits`)
+    limits: Vec<(String, String)>,
     cx: Vec<String>,
     /// the SMT binders of the quantifiers in scope (`(k_q0 Int)`), so that a
     /// guard inside a `forall`/`exists` body can refer to their variables
@@ -417,6 +471,26 @@ fn datatype_decls(names: &[String], types: &TypeDefs) -> R<Vec<String>> {
     order.iter().map(|n| datatype_decl(types.enums.get(n).ok_or_else(|| format!("unknown enum `{n}`"))?, types)).collect()
 }
 
+/// `(exists (BINDERS) BODY)` → `(BINDERS, BODY)`.
+fn split_exists(s: &str) -> Option<(String, String)> {
+    let rest = s.strip_prefix("(exists (")?;
+    let mut depth = 1i32;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let body = rest[i + 1..].trim().strip_suffix(')')?;
+                    return Some((rest[..i].to_string(), body.trim().to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl<'a> Lo<'a> {
     fn ctx(&self) -> String {
         and(self.cx.clone())
@@ -429,15 +503,108 @@ impl<'a> Lo<'a> {
         self.wf.push((v, what));
     }
 
+    /// A limit of the encoding: `g` holds wherever the term built is exact.
+    fn limit(&mut self, g: String, what: String) {
+        let c = self.ctx();
+        let v = and(vec![c, not(&g)]);
+        let v = if self.quant.is_empty() { v } else { format!("(exists ({}) {})", self.quant.join(" "), v) };
+        self.limits.push((v, what));
+    }
+
     fn use_datatype(&mut self, n: &str) {
         if !self.datatypes.iter().any(|x| x == n) {
             self.datatypes.push(n.to_string());
         }
     }
 
+    /// A width `w` such that the non-negative values of `e` (lowered to `t`)
+    /// are below `2^w`, when it is evident: a bit vector built here, a
+    /// machine value, a bit count, a literal.
+    fn value_width(&self, e: &Expr, t: &IntT) -> Option<u32> {
+        if let Some((_, w)) = self.bvs.get(&t.s()) {
+            return Some(*w);
+        }
+        if let Some(n) = t.lit() {
+            return Some((64 - (n.max(0) as u64).leading_zeros()).max(1));
+        }
+        match &e.kind {
+            ExprKind::Method(m) if matches!(&**m, Method::BitCount(..)) => Some(8),
+            _ => self.unsigned_width(e, t),
+        }
+    }
+
+    /// The width of an unsigned machine value (or of a bit vector built here).
+    fn unsigned_width(&self, e: &Expr, t: &IntT) -> Option<u32> {
+        if let Some((_, w)) = self.bvs.get(&t.s()) {
+            return Some(*w);
+        }
+        if let Some(w) = BV_DECLARED.with(|m| m.borrow().get(&t.s()).copied()) {
+            return Some(w);
+        }
+        // a cast keeps the value (`(x + 1) as u8` may be 256): no width
+        if matches!(e.kind, ExprKind::Cast(..)) {
+            return None;
+        }
+        match self.int_width(e) {
+            Ok((false, w)) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// `t` as a `w`-bit vector: the vector itself when `t` is one built here.
+    fn to_bv(&self, t: &IntT, w: u32) -> String {
+        let declared = BV_DECLARED.with(|m| m.borrow().get(&t.s()).copied());
+        if let Some(dw) = declared {
+            let b = format!("{}_bv", t.s());
+            return if dw == w {
+                b
+            } else if dw < w {
+                format!("((_ zero_extend {}) {b})", w - dw)
+            } else {
+                format!("((_ extract {} 0) {b})", w - 1)
+            };
+        }
+        match self.bvs.get(&t.s()) {
+            Some((b, bw)) if *bw == w => b.clone(),
+            Some((b, bw)) if *bw < w => format!("((_ zero_extend {}) {b})", w - bw),
+            _ => format!("((_ int2bv {w}) {})", t.s()),
+        }
+    }
+
+    /// The natural number of the `w`-bit vector `bv`, remembered as one.
+    fn from_bv(&mut self, bv: String, w: u32) -> IntT {
+        let t = format!("(bv2nat {bv})");
+        self.bvs.insert(t.clone(), (bv, w));
+        IntT::Term(t)
+    }
+
+    /// Signedness and width of a machine integer: a parameter or output, an
+    /// element of one, or a cast (a `usize` is taken as 64 bits).
+    fn int_width(&self, e: &Expr) -> R<(bool, u32)> {
+        let t = match &e.kind {
+            ExprKind::Var(v) | ExprKind::Old(v) => self.vtypes.get(v).cloned(),
+            ExprKind::Index(s, _) => match &s.kind {
+                ExprKind::Var(v) => match self.vtypes.get(v) {
+                    Some(RType::Seq(el, _)) => Some((**el).clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            ExprKind::Cast(_, t) => Some(t.clone()),
+            _ => None,
+        };
+        match t {
+            Some(RType::Int { signed, bits }) => Ok((signed, if bits == 0 { 64 } else { bits })),
+            _ => Err("smoke-test needs the receiver of a width-dependent method (`.count_ones()`, `.rotate_left(n)`, `.wrapping_add(y)`, …) to be a parameter, an element of one, or a cast".into()),
+        }
+    }
+
     fn with<T>(&mut self, binds: Vec<(String, Val)>, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
         let mut saved = Vec::new();
+        let mut saved_types = Vec::new();
         for (n, v) in binds {
+            // a binder's type is not tracked: it shadows any parameter's
+            saved_types.push((n.clone(), self.vtypes.remove(&n)));
             saved.push((n.clone(), self.env.insert(n, v)));
         }
         let r = f(self);
@@ -446,6 +613,11 @@ impl<'a> Lo<'a> {
                 Some(v) => self.env.insert(n, v),
                 None => self.env.remove(&n),
             };
+        }
+        for (n, t) in saved_types {
+            if let Some(t) = t {
+                self.vtypes.insert(n, t);
+            }
         }
         r
     }
@@ -651,9 +823,18 @@ impl<'a> Lo<'a> {
                 }
                 let nq = qvars.len();
                 self.quant.extend(qvars.iter().cloned());
+                let saved_wf = self.wf.len();
                 let b = self.with(binds, |l| l.stmts(body))?;
                 self.quant.truncate(self.quant.len() - nq);
                 let inner = and(ranges.into_iter().chain(std::iter::once(b)).collect());
+                // well-formedness inside is stated for the binders' values that
+                // satisfy the body (as `Spec.lean` states it): a violation is
+                // one with the body true, not any value of the binders
+                for (w, _) in self.wf[saved_wf..].iter_mut() {
+                    if let Some((q, rest)) = split_exists(w) {
+                        *w = format!("(exists ({q}) (and {inner} {rest}))");
+                    }
+                }
                 Ok(format!("(exists ({}) {})", qvars.join(" "), inner))
             }
             StmtKind::Cases(alts) => {
@@ -822,6 +1003,7 @@ impl<'a> Lo<'a> {
         }
         // a fresh lowering context for the callee: its own env
         let saved_env = std::mem::take(&mut self.env);
+        let saved_vtypes = std::mem::replace(&mut self.vtypes, d.inputs().into_iter().chain(d.outputs()).collect());
         let saved_pre = self.pre_scope;
         let saved_muts = std::mem::take(&mut self.muts);
         self.depth += 1;
@@ -847,6 +1029,7 @@ impl<'a> Lo<'a> {
         self.depth -= 1;
         self.site.pop();
         self.env = saved_env;
+        self.vtypes = saved_vtypes;
         self.pre_scope = saved_pre;
         self.muts = saved_muts;
         let (pre_s, body) = res?;
@@ -1074,7 +1257,14 @@ impl<'a> Lo<'a> {
                     Some(val) => val,
                     None => {
                         if let Some(c) = self.types.consts.get(v).cloned() {
-                            self.term(&c.value)?
+                            if let Some(elems) = &c.table {
+                                if elems.len() > TABLE_LIMIT {
+                                    return Err(format!("the table `{v}` has {} elements; smoke-test expands tables of at most {TABLE_LIMIT}", elems.len()));
+                                }
+                                Val::Seq(elems.iter().map(|x| Val::Int(match x.parse::<i64>() { Ok(n) => IntT::Lit(n), Err(_) => IntT::Term(smt_int(x)) })).collect())
+                            } else {
+                                self.term(&c.value)?
+                            }
                         } else {
                             return Err(format!("unknown variable `{v}`"));
                         }
@@ -1093,9 +1283,128 @@ impl<'a> Lo<'a> {
                     _ => return Err("unsupported cast".into()),
                 }
             }
+            ExprKind::Bin(op @ (BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor), l, r) => {
+                let a = self.num(l)?;
+                let b = self.num(r)?;
+                for x in [&a, &b] {
+                    if x.lit().map(|n| n < 0).unwrap_or(true) {
+                        self.guard(format!("(>= {} 0)", x.s()), "a negative operand of `&`, `|` or `^`".into());
+                    }
+                }
+                if let (Some(x), Some(y)) = (a.lit(), b.lit()) {
+                    if x >= 0 && y >= 0 {
+                        return Ok(Val::Int(IntT::Lit(match op {
+                            BinOp::BitAnd => x & y,
+                            BinOp::BitOr => x | y,
+                            _ => x ^ y,
+                        })));
+                    }
+                }
+                let f = match op {
+                    BinOp::BitAnd => "bvand",
+                    BinOp::BitOr => "bvor",
+                    _ => "bvxor",
+                };
+                // the operands' common width when both are evidently below
+                // it (they are non-negative by the guard), else 128 bits
+                let w = match (self.value_width(l, &a), self.value_width(r, &b)) {
+                    (Some(x), Some(y)) => x.max(y),
+                    _ => 128,
+                };
+                let bv = format!("({f} {} {})", self.to_bv(&a, w), self.to_bv(&b, w));
+                Val::Int(self.from_bv(bv, w))
+            }
+            ExprKind::Bin(op @ (BinOp::Shl | BinOp::Shr), l, r) => {
+                let a = self.num(l)?;
+                let n = self.num(r)?;
+                let shl = *op == BinOp::Shl;
+                let pow = |k: i64| {
+                    let p = 1i128 << k;
+                    match i64::try_from(p) {
+                        Ok(v) => IntT::Lit(v),
+                        Err(_) => IntT::Term(p.to_string()),
+                    }
+                };
+                let sym = if shl { "*" } else { "div" };
+                // the semantics is Lean's (lower.rs): `a <<< n` and `a >>> n` on
+                // a natural number, `a * 2^n` and `a / 2^n` (floor) on an
+                // integer — no limit on `n` — and `n ≥ 0` is the obligation
+                if let Some(k) = n.lit() {
+                    // a right shift of a value known to be a bit vector stays one
+                    if !shl && a.lit().is_none() {
+                        if let Some(w) = self.unsigned_width(l, &a) {
+                            if k >= w as i64 {
+                                return Ok(Val::Int(IntT::Lit(0)));
+                            }
+                            if k >= 0 {
+                                let bv = format!("(bvlshr {} ((_ int2bv {w}) {k}))", self.to_bv(&a, w));
+                                return Ok(Val::Int(self.from_bv(bv, w)));
+                            }
+                        }
+                    }
+                    if !(0..=126).contains(&k) {
+                        return Err(format!("shift amount {k} is outside what smoke-test expands (0..=126)"));
+                    }
+                    return Ok(Val::Int(arith(sym, &a, &pow(k))));
+                }
+                self.guard(format!("(>= {} 0)", n.s()), "a negative shift amount".into());
+                // an unsigned machine value shifts as a bit vector: `>>` at its
+                // width (0 once the amount reaches it), `<<` at its width plus
+                // the amount's largest value when the amount is a machine value
+                // of at most 9 bits, else at 128 bits (exact while the result
+                // fits: a limit beyond)
+                if let Some(w) = self.unsigned_width(l, &a) {
+                    if shl {
+                        let exact = self.unsigned_width(r, &n).filter(|wn| *wn <= 9).map(|wn| w + (1u32 << wn) - 1);
+                        let ww = match exact {
+                            Some(ww) => ww.max(128),
+                            None => {
+                                self.limit(format!("(<= {} {})", n.s(), 128 - w), "a left shift past 128 bits".into());
+                                128
+                            }
+                        };
+                        let bv = format!("(bvshl {} {})", self.to_bv(&a, ww), self.to_bv(&n, ww));
+                        return Ok(Val::Int(self.from_bv(bv, ww)));
+                    }
+                    let bv = format!("(ite (< {} {w}) (bvlshr {} {}) (_ bv0 {w}))", n.s(), self.to_bv(&a, w), self.to_bv(&n, w));
+                    return Ok(Val::Int(self.from_bv(bv, w)));
+                }
+                // otherwise one case per amount up to 126; beyond, `>>` of a
+                // value within 126 bits is exactly 0 or -1, and `<<` is a limit
+                let beyond = if shl {
+                    self.limit(format!("(<= {} 126)", n.s()), "a left shift by more than 126 bits".into());
+                    arith("*", &a, &pow(126)).s()
+                } else {
+                    let h = 1i128 << 126;
+                    self.limit(format!("(or (<= {} 126) (and (<= (- {h}) {}) (< {} {h})))", n.s(), a.s(), a.s()), "a right shift by more than 126 bits of a value of more than 126 bits".into());
+                    format!("(ite (>= {} 0) 0 (- 1))", a.s())
+                };
+                let mut t = beyond;
+                for k in (0..=126).rev() {
+                    t = format!("(ite (= {} {k}) {} {t})", n.s(), arith(sym, &a, &pow(k)).s());
+                }
+                Val::Int(IntT::Term(t))
+            }
             ExprKind::Bin(op, l, r) if op.is_arith() => {
                 let a = self.num(l)?;
                 let b = self.num(r)?;
+                // the low `k` bits of a bit vector: a remainder by `2^k`
+                if *op == BinOp::Rem {
+                    let vector = self.bvs.get(&a.s()).map(|(_, w)| *w).or_else(|| BV_DECLARED.with(|m| m.borrow().get(&a.s()).copied()));
+                    if let (Some(w), Ok(m)) = (vector, b.s().parse::<u128>()) {
+                        if m.is_power_of_two() && a.lit().is_none() {
+                            let k = m.trailing_zeros();
+                            if k == 0 {
+                                return Ok(Val::Int(IntT::Lit(0)));
+                            }
+                            if w <= k {
+                                return Ok(Val::Int(a));
+                            }
+                            let bv = format!("((_ extract {} 0) {})", k - 1, self.to_bv(&a, w));
+                            return Ok(Val::Int(self.from_bv(bv, k)));
+                        }
+                    }
+                }
                 let (sym, guard) = match op {
                     BinOp::Add => ("+", false),
                     BinOp::Sub => ("-", false),
@@ -1185,8 +1494,14 @@ impl<'a> Lo<'a> {
             }
             ExprKind::IfVal(c, a, b) => {
                 let cp = self.prop(c)?;
-                let av = self.term(a)?;
-                let bv = self.term(b)?;
+                // each branch's partial operations are owed only where it is taken
+                self.cx.push(cp.clone());
+                let av = self.term(a);
+                self.cx.pop();
+                self.cx.push(not(&cp));
+                let bv = self.term(b);
+                self.cx.pop();
+                let (av, bv) = (av?, bv?);
                 match (av, bv) {
                     (Val::Int(x), Val::Int(y)) => Val::Int(IntT::Term(format!("(ite {cp} {} {})", x.s(), y.s()))),
                     (Val::Bool(x), Val::Bool(y)) => Val::Bool(format!("(ite {cp} {x} {y})")),
@@ -1261,6 +1576,42 @@ impl<'a> Lo<'a> {
                     Val::Int(IntT::Term(format!("(val {t})")))
                 }
                 Method::AsBytes(s) => self.term(s)?,
+                Method::BitCount(k, x) => {
+                    let (signed, w) = self.int_width(x)?;
+                    let v = self.num(x)?;
+                    if let Some(n) = v.lit() {
+                        let _ = signed;
+                        return Ok(Val::Int(IntT::Lit(k.eval(n as i128 as u128, w) as i64)));
+                    }
+                    let bv = self.to_bv(&v, w);
+                    Val::Int(IntT::Term(bit_count_smt(*k, &bv, w)))
+                }
+                Method::Rotate(left, x, n) => {
+                    let (signed, w) = self.int_width(x)?;
+                    let v = self.num(x)?;
+                    let k = self.num(n)?;
+                    let bv = format!("({} {} {})", if *left { "ext_rotate_left" } else { "ext_rotate_right" }, self.to_bv(&v, w), self.to_bv(&k, w));
+                    if signed {
+                        Val::Int(IntT::Term(to_signed(&format!("(bv2nat {bv})"), w)))
+                    } else {
+                        Val::Int(self.from_bv(bv, w))
+                    }
+                }
+                Method::Wrapping(op, x, y) => {
+                    let (signed, w) = self.int_width(x)?;
+                    let a = self.num(x)?;
+                    let b = self.num(y)?;
+                    let sym = match op {
+                        BinOp::Add => "+",
+                        BinOp::Sub => "-",
+                        _ => "*",
+                    };
+                    let m = format!("(mod ({sym} {} {}) {})", a.s(), b.s(), 1i128 << w.min(126));
+                    if w > 126 {
+                        return Err("128-bit wrapping arithmetic is not smoke-tested".into());
+                    }
+                    Val::Int(IntT::Term(if signed { to_signed(&m, w) } else { m }))
+                }
                 Method::MapGet(..) => return Err("maps are not smoke-tested".into()),
                 m if m.is_prop() => Val::Bool(self.prop(e)?),
                 _ => return Err("unsupported method in smoke-test".into()),
@@ -1342,6 +1693,50 @@ struct Sym {
     smt: Vec<String>,
 }
 
+thread_local! {
+    /// Declare machine integers as bit vectors (their `Int` defined from
+    /// them): set for programs that use bit operations, where Z3 is fast on
+    /// bit vectors and gives up on `int2bv` of plain integers.
+    static BV_SYMBOLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The unsigned symbols declared as bit vectors in the current query,
+    /// with their widths: `x` is `(bv2nat x_bv)`.
+    static BV_DECLARED: std::cell::RefCell<HashMap<String, u32>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Start a query: bit-vector symbols if `d` uses bit operations.
+fn bv_query(d: &Decl) {
+    BV_SYMBOLS.with(|c| c.set(d.uses_bitwise()));
+    BV_DECLARED.with(|m| m.borrow_mut().clear());
+}
+
+/// Declare `nm` as an integer of type `t`, with its range when `small` asks
+/// for one (`range` adds it to `side`): a plain `Int`, or, for a machine
+/// integer in a declaration with bit operations, the value of a bit vector.
+/// A bit vector's range is its width, and a small range is stated on the
+/// vector (Z3 gives up on integer bounds of `bv2nat` terms).
+#[allow(clippy::too_many_arguments)]
+fn declare_int(nm: &str, t: &RType, quantified: bool, small: bool, int_bound: i64, decls: &mut Vec<String>, side: &mut Vec<String>, range: &dyn Fn(&str, &RType, &mut Vec<String>)) {
+    match t {
+        RType::Int { signed, bits } if !quantified && BV_SYMBOLS.with(|c| c.get()) => {
+            let w = if *bits == 0 { 64 } else { *bits };
+            decls.push(format!("(declare-const {nm}_bv (_ BitVec {w}))"));
+            let u = format!("(bv2nat {nm}_bv)");
+            decls.push(format!("(define-fun {nm} () Int {})", if *signed { to_signed(&u, w) } else { u }));
+            if !*signed {
+                BV_DECLARED.with(|m| m.borrow_mut().insert(nm.to_string(), w));
+            }
+            if small {
+                let b = format!("(_ bv{int_bound} {w})");
+                side.push(if *signed { format!("(and (bvsle (bvneg {b}) {nm}_bv) (bvsle {nm}_bv {b}))") } else { format!("(bvule {nm}_bv {b})") });
+            }
+        }
+        _ => {
+            decls.push(format!("(declare-const {nm} Int)"));
+            range(nm, t, side);
+        }
+    }
+}
+
 /// Declare a symbolic variable. Range constraints go to `side`; with
 /// `quantified`, no `declare-const` is emitted (the caller binds the names).
 #[allow(clippy::too_many_arguments)]
@@ -1362,8 +1757,7 @@ fn declare(prefix: &str, name: &str, ty: &RType, len: usize, decls: &mut Vec<Str
     Ok(match ty {
         RType::Int { .. } | RType::Char => {
             let nm = format!("{prefix}{name}");
-            decls.push(format!("(declare-const {nm} Int)"));
-            range_assert(&nm, ty, side);
+            declare_int(&nm, ty, quantified, small, int_bound, decls, side, &range_assert);
             (Sym { name: name.into(), ty: ty.clone(), smt: vec![nm.clone()] }, Val::Int(IntT::Term(nm)))
         }
         RType::Named(en) if types.enums.contains_key(en) => {
@@ -1403,8 +1797,7 @@ fn declare(prefix: &str, name: &str, ty: &RType, len: usize, decls: &mut Vec<Str
                 let nm = format!("{prefix}{name}_{k}");
                 match &**elem {
                     RType::Int { .. } | RType::Char => {
-                        decls.push(format!("(declare-const {nm} Int)"));
-                        range_assert(&nm, elem, side);
+                        declare_int(&nm, elem, quantified, small, int_bound, decls, side, &range_assert);
                         vals.push(Val::Int(IntT::Term(nm.clone())));
                     }
                     RType::Bool => {
@@ -1475,17 +1868,21 @@ fn explain(
     lens: &HashMap<String, usize>,
     fixed: Option<&HashMap<String, String>>,
 ) -> R<Option<(Vec<(bool, usize)>, Option<String>)>> {
+    bv_query(d);
     let mut lo = Lo {
         decls,
         types,
         bounds,
         small,
         env: HashMap::new(),
+        vtypes: d.inputs().into_iter().chain(d.outputs()).collect(),
+        bvs: HashMap::new(),
         pre_scope: true,
         muts: d.params.iter().filter(|p| p.mut_ref).map(|p| p.name.clone()).collect(),
         decls_out: Vec::new(),
         side: Vec::new(),
         wf: Vec::new(),
+        limits: Vec::new(),
         cx: Vec::new(),
         quant: Vec::new(),
         fresh: 0,
@@ -1629,22 +2026,30 @@ enum Check {
     Unambiguous,
     Ensures(usize),
     Wf,
+    /// can the declaration reach a limit of the encoding (`Lo::limits`)?
+    /// The specification is not asserted (its encoding is not exact there):
+    /// the preconditions and the limits' own path conditions only
+    Limits,
 }
 
 /// Build a query for one declaration, one assignment of sequence lengths
 /// (indexed by variable name) and one integer regime.
 fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bounds, small: bool, lens: &HashMap<String, usize>, check: Check) -> R<Query> {
+    bv_query(d);
     let mut lo = Lo {
         decls,
         types,
         bounds,
         small,
         env: HashMap::new(),
+        vtypes: d.inputs().into_iter().chain(d.outputs()).collect(),
+        bvs: HashMap::new(),
         pre_scope: true,
         muts: d.params.iter().filter(|p| p.mut_ref).map(|p| p.name.clone()).collect(),
         decls_out: Vec::new(),
         side: Vec::new(),
         wf: Vec::new(),
+        limits: Vec::new(),
         cx: Vec::new(),
         quant: Vec::new(),
         fresh: 0,
@@ -1733,8 +2138,13 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
             }
             lo.wf.clear();
             lo.call_seq = 0;
+            let before = lo.limits.len();
             let spec = lo.stmts(&d.body)?;
-            let body = imp(&and(ranges), &not(&spec));
+            // the limits of this output's encoding are in the outputs' scope:
+            // every output must be exactly encoded, and fail the relation
+            let here: Vec<String> = lo.limits.drain(before..).map(|(f, _)| f).collect();
+            let fails = if here.is_empty() { not(&spec) } else { and(vec![not(&or(here)), not(&spec)]) };
+            let body = imp(&and(ranges), &fails);
             existence_parts.push(if qvars.is_empty() { body } else { format!("(forall ({}) {})", qvars.join(" "), body) });
         }
         outputs.push(Vec::new());
@@ -1791,8 +2201,27 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
         text.push_str(&format!("(assert {s})\n"));
     }
     text.push_str(&format!("(assert {pre_s})\n"));
+    if !lo.limits.is_empty() && check != Check::Limits {
+        let reached: Vec<String> = lo.limits.iter().map(|(f, _)| f.clone()).collect();
+        text.push_str(&format!("(assert (not {}))\n", or(reached)));
+    }
     match check {
         Check::PreSat => {}
+        Check::Limits => {
+            let mut hit = Vec::new();
+            for (k, (formula, what)) in lo.limits.iter().enumerate() {
+                let nm = format!("lim_{k}");
+                text.push_str(&format!("(define-fun {nm} () Bool {})\n", formula));
+                wf_flags.push((nm.clone(), what.clone()));
+                hit.push(nm);
+            }
+            if hit.is_empty() {
+                text.push_str("(assert false)\n");
+                text.push_str(";; no-limits\n");
+            } else {
+                text.push_str(&format!("(assert {})\n", or(hit)));
+            }
+        }
         Check::Consistent => {
             text.push_str(&format!("(assert {})\n", specs[0]));
         }
@@ -1959,6 +2388,9 @@ fn run_check(z3: &mut Z3, d: &Decl, decls: &HashMap<String, &Decl>, types: &Type
             }
             any_partial = true;
         }
+        if check == Check::Limits && q.text.contains(";; no-limits") {
+            continue;
+        }
         z3.send("(reset)");
         z3.send(&format!("(set-option :timeout {})", bounds.timeout_ms));
         z3.send("(set-option :produce-models true)");
@@ -1992,6 +2424,9 @@ fn run_check(z3: &mut Z3, d: &Decl, decls: &HashMap<String, &Decl>, types: &Type
                         why = hits.join("; ");
                     }
                     found.push(Found { inputs: ins, outputs: outs, why, model: model.clone(), lens: lens.clone() });
+                }
+                if check == Check::Limits {
+                    return Ok((found, total, unknown));
                 }
                 if total >= bounds.max_examples {
                     return Ok((found, total, unknown));
@@ -2040,6 +2475,23 @@ pub struct SmokeReport {
     pub all_ok: bool,
 }
 
+impl SmokeReport {
+    /// How many checks were unsupported or inconclusive (they say nothing
+    /// about the specification), of how many (skipped and not-applicable
+    /// checks count in neither).
+    pub fn coverage(&self) -> (usize, usize) {
+        let checks = self.decls.iter().flat_map(|d| d.checks.iter()).filter(|c| !matches!(c.status, CheckStatus::NotApplicable | CheckStatus::Skipped));
+        let (mut u, mut n) = (0, 0);
+        for c in checks {
+            n += 1;
+            if matches!(c.status, CheckStatus::Unsupported(_) | CheckStatus::Inconclusive(_)) {
+                u += 1;
+            }
+        }
+        (u, n)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DeclReport {
     pub name: String,
@@ -2073,6 +2525,9 @@ pub enum CheckStatus {
         example_input: Option<String>,
     },
     Unsupported(String),
+    /// the check ran but cannot conclude: the solver gave up, or the
+    /// specification reaches past what smoke-test models exactly
+    Inconclusive(String),
     NotApplicable,
     /// the declaration carries `#[override_smoke_test]`
     Skipped,
@@ -2147,7 +2602,7 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
         // preconditions first: if they cannot be met within the input bounds,
         // every other check would be vacuous (and possibly huge)
         let pre_ok = match run_check(&mut z3, d, &map, types, bounds, false, Check::PreSat) {
-            Ok((found, _, _)) => !found.is_empty(),
+            Ok((found, _, unknown)) => !found.is_empty() || unknown,
             Err(_) => true,
         };
         if !pre_ok {
@@ -2162,6 +2617,23 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
             out.push(DeclReport { name: d.name.clone(), kind: kind.into(), line: st.line, col: st.column + 1, file: d.file, checks: reports });
             continue;
         }
+        // a limit of the encoding the declaration can reach: then finding
+        // nothing (no witness, no counterexample) concludes nothing
+        let beyond: Option<String> = match run_check(&mut z3, d, &map, types, bounds, false, Check::Limits) {
+            Ok((found, _, unknown)) => match found.first() {
+                Some(f) => Some(format!("{} (e.g. at {})", if f.why.is_empty() { "an operation smoke-test does not model exactly" } else { &f.why }, f.inputs)),
+                None if unknown => Some("an operation smoke-test does not model exactly (the solver could not rule it out)".into()),
+                None => None,
+            },
+            Err(_) => None,
+        };
+        let inconclusive = |unknown: bool, nothing: &str| -> Option<CheckStatus> {
+            if unknown {
+                Some(CheckStatus::Inconclusive(format!("{nothing}, but the solver gave up on some sizes (raise --timeout)")))
+            } else {
+                beyond.as_ref().map(|b| CheckStatus::Inconclusive(format!("{nothing} where smoke-test's encoding is exact, but the specification can reach {b}, beyond it")))
+            }
+        };
         for (check, label) in checks {
             let mut result = None;
             let mut unsupported = None;
@@ -2172,10 +2644,8 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                             result = Some((Some((found, total, small)), unknown));
                             break;
                         }
+                        // the full ranges decide what the small ones left open
                         result = Some((None, unknown));
-                        if check == Check::Consistent && unknown {
-                            break;
-                        }
                     }
                     Err(e) => {
                         unsupported = Some(e);
@@ -2193,8 +2663,11 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                         let f = &found[0];
                         CheckStatus::Ok { note: format!("satisfiable; e.g. {} with {}", f.inputs, f.outputs) }
                     }
+                    // unsat only is a contradiction; `unknown` is not
+                    (Check::Consistent, None) if inconclusive(unknown, "no witness found").is_some() => inconclusive(unknown, "no witness found").unwrap(),
                     (Check::Consistent, None) if !matches!(run_check(&mut z3, d, &map, types, bounds, false, Check::PreSat), Ok((ref f, _, _)) if !f.is_empty()) => {
                         // not even the preconditions can be met within the bounds
+                        // (or the solver could not tell)
                         CheckStatus::Unsupported(format!(
                             "the preconditions cannot be met within the bounds (sequences up to length {}): raise --max-len / --int-bound",
                             bounds.max_len
@@ -2214,7 +2687,7 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                             }
                         }
                         CheckStatus::Problem {
-                            what: format!("CONTRADICTION{}", if unknown { " (solver gave up on some sizes)" } else { "" }),
+                            what: "CONTRADICTION".into(),
                             how_many: "no input/output satisfies the relation within the bounds".into(),
                             examples: Vec::new(),
                             conflict_title: title,
@@ -2229,7 +2702,7 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                             Check::Existence => "NO OUTPUT FOR SOME INPUT",
                             Check::Ensures(_) => "ENSURES VIOLATED",
                             Check::Wf => "ILL-FORMED",
-                            Check::Consistent | Check::PreSat => unreachable!(),
+                            Check::Consistent | Check::PreSat | Check::Limits => unreachable!(),
                         };
                         let mut examples = Vec::new();
                         for (k, f) in found.iter().enumerate() {
@@ -2276,8 +2749,9 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                             example_input: if check == Check::Existence { Some(found[0].inputs.clone()) } else { None },
                         }
                     }
-                    (_, None) => CheckStatus::Ok {
-                        note: format!("no counterexample within the bounds{}", if unknown { " (solver gave up on some sizes: inconclusive)" } else { "" }),
+                    (_, None) => match inconclusive(unknown, "no counterexample found") {
+                        Some(st) => st,
+                        None => CheckStatus::Ok { note: "no counterexample within the bounds".into() },
                     },
                 },
             };
@@ -2308,6 +2782,7 @@ pub fn print_report(r: &SmokeReport, bounds: &Bounds, paths: &[String]) {
                 CheckStatus::NotApplicable => println!("  {label:16} n/a (no partial operations or callee preconditions)"),
                 CheckStatus::Skipped => println!("  {label:16} skipped — #[override_smoke_test]"),
                 CheckStatus::Unsupported(e) => println!("  {label:16} unsupported: {e}"),
+                CheckStatus::Inconclusive(e) => println!("  {label:16} INCONCLUSIVE: {e}"),
                 CheckStatus::Problem { what, how_many, examples, conflict_title, conflicts, example_input } => {
                     println!("  {label:16} {what}: {how_many}");
                     for (k, e) in examples.iter().enumerate() {
@@ -2333,14 +2808,20 @@ pub fn print_report(r: &SmokeReport, bounds: &Bounds, paths: &[String]) {
         }
     }
     println!();
-    if r.all_ok {
+    let (unsupported, total) = r.coverage();
+    if r.all_ok && unsupported > 0 {
+        // not a clean result: the unsupported checks say nothing
+        println!("smoke-test: INCOMPLETE: no contradiction and no counterexample among the checks it could run, but {unsupported} of {total} checks are unsupported or inconclusive (listed above) and say nothing about the specification.");
+    } else if r.all_ok {
         println!("smoke-test: no contradiction and no counterexample within the bounds (this is not a proof).");
     } else {
         println!("smoke-test: problems found; fix the specification before paying an agent.");
     }
 }
 
-pub fn smoke_test(cfg: &Config, bounds: &Bounds) -> std::result::Result<bool, String> {
+/// Exit status: 0 every check ran and found nothing, 1 problems found, 3 nothing
+/// found but some checks were unsupported or inconclusive (an incomplete result).
+pub fn smoke_test(cfg: &Config, bounds: &Bounds) -> std::result::Result<u8, String> {
     let texts = cfg.spec_texts()?;
     if texts.is_empty() {
         return Err(format!("{}: no `djinn! {{ … }}` declarations found", cfg.specs_display()));
@@ -2349,5 +2830,96 @@ pub fn smoke_test(cfg: &Config, bounds: &Bounds) -> std::result::Result<bool, St
     let srcs: Vec<String> = texts.into_iter().map(|(_, t)| t).collect();
     let r = smoke_run_sources(&srcs, bounds).map_err(|(i, e)| format!("{}:{e}", paths.get(i).cloned().unwrap_or_default()))?;
     print_report(&r, bounds, &paths);
-    Ok(r.all_ok)
+    Ok(match (r.all_ok, r.coverage().0) {
+        (false, _) => 1,
+        (true, 0) => 0,
+        (true, _) => 3,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(body: &str) -> SmokeReport {
+        let src = format!("use djinn::djinn;\ndjinn! {{\n{body}\n}}\n");
+        smoke_run(&src, &Bounds { timeout_ms: 5_000, ..Default::default() }).unwrap()
+    }
+
+    fn status<'a>(r: &'a SmokeReport, decl: &str, label: &str) -> &'a CheckStatus {
+        let d = r.decls.iter().find(|d| d.name == decl).unwrap();
+        &d.checks.iter().find(|c| c.label.starts_with(label)).unwrap_or_else(|| panic!("no check {label} in {:?}", d.checks)).status
+    }
+
+    fn is_ok(s: &CheckStatus) -> bool {
+        matches!(s, CheckStatus::Ok { .. })
+    }
+
+    #[test]
+    fn right_shift_by_a_wide_or_large_amount_is_zero() {
+        // `x >> n` is `x / 2^n`: zero once n ≥ 8, also for n = 256, whose low
+        // 8 bits are 0 (the model once shifted by those)
+        let r = run("#[ensures(n >= 8 => r == 0)]\npub fn f(x: u8, n: u32) -> r: u32 { r == x >> n; }\n\
+                     #[ensures(r == 0)]\npub fn g(x: u8) -> r: u32 { r == x >> 256; }");
+        assert!(is_ok(status(&r, "f", "ensures 0")), "{:?}", status(&r, "f", "ensures 0"));
+        assert!(is_ok(status(&r, "g", "ensures 0")), "{:?}", status(&r, "g", "ensures 0"));
+        assert!(r.all_ok);
+    }
+
+    #[test]
+    fn left_shift_never_drops_bits() {
+        // `<<` multiplies: a u8 amount stays exact (no 128-bit limit), and no
+        // amount is a well-formedness violation of the specification
+        let r = run("#[ensures(r >= x)]\npub rel f(x: u8, n: u8) -> r: int { r == x << n; }");
+        assert!(is_ok(status(&r, "f", "ensures 0")), "{:?}", status(&r, "f", "ensures 0"));
+        assert!(!status(&r, "f", "well-formedness").is_problem(), "{:?}", status(&r, "f", "well-formedness"));
+        assert!(r.all_ok);
+    }
+
+    #[test]
+    fn left_shift_beyond_the_model_is_inconclusive_not_ill_formed() {
+        // a u32 amount can exceed what smoke-test models: that says nothing
+        // about the specification (Lean's `<<<` has no limit)
+        let r = run("#[ensures(r >= x)]\npub rel f(x: u64, n: u32) -> r: int { r == x << n; }");
+        for c in &r.decls[0].checks {
+            assert!(!c.status.is_problem(), "{}: {:?}", c.label, c.status);
+        }
+        assert!(matches!(status(&r, "f", "ensures 0"), CheckStatus::Inconclusive(_)), "{:?}", status(&r, "f", "ensures 0"));
+        assert!(r.coverage().0 > 0);
+        assert!(matches!(status(&r, "f", "consistency"), CheckStatus::Ok { .. }), "{:?}", status(&r, "f", "consistency"));
+        // a precondition that keeps the amount in range makes it conclusive
+        let r = run("#[requires(n < 32)]\n#[ensures(r >= x)]\npub rel f(x: u8, n: u32) -> r: int { r == x << n; }");
+        assert!(is_ok(status(&r, "f", "ensures 0")), "{:?}", status(&r, "f", "ensures 0"));
+        assert!(is_ok(status(&r, "f", "consistency")), "{:?}", status(&r, "f", "consistency"));
+        assert!(r.all_ok && r.coverage().0 == 0, "{:?}", r.decls[0].checks);
+    }
+
+    #[test]
+    fn a_solver_timeout_is_inconclusive_not_a_contradiction() {
+        // satisfiable (x, y, z = 8866128975287528, -8778405442862239,
+        // -2736111468807040), but no solver finds it in half a second
+        let src = "use djinn::djinn;\ndjinn! {\npub rel cubes(x: i64, y: i64, z: i64) -> r: i64 { r == 0; x * x * x + y * y * y + z * z * z == 33; }\n}\n";
+        let r = smoke_run(src, &Bounds { timeout_ms: 500, ..Default::default() }).unwrap();
+        let c = status(&r, "cubes", "consistency");
+        assert!(matches!(c, CheckStatus::Inconclusive(_)), "{c:?}");
+        // an inconclusive check makes the run incomplete, not clean
+        assert!(r.all_ok);
+        assert!(r.coverage().0 > 0);
+    }
+
+    #[test]
+    fn remainder_by_one_is_zero() {
+        let r = run("#[ensures(r == 0)]\npub fn f(x: u32, y: u32) -> r: u32 { r == (x & y) % 1; }\n\
+                     #[ensures(r < 4)]\npub fn g(x: u32, y: u32) -> r: u32 { r == (x | y) % 4; }");
+        assert!(is_ok(status(&r, "f", "ensures 0")), "{:?}", status(&r, "f", "ensures 0"));
+        assert!(is_ok(status(&r, "g", "ensures 0")), "{:?}", status(&r, "g", "ensures 0"));
+        assert!(r.all_ok);
+    }
+
+    #[test]
+    fn a_cast_does_not_truncate_in_a_bit_operation() {
+        // casts are value-preserving in the specification: (300 as u8) >> 1 is 150
+        let r = run("#[requires(x == 300)]\n#[ensures(r == 150)]\npub fn f(x: u32, n: u32) -> r: u32 { r == ((x + 0) as u8) >> (n - n + 1); }");
+        assert!(is_ok(status(&r, "f", "ensures 0")), "{:?}", status(&r, "f", "ensures 0"));
+    }
 }

@@ -309,3 +309,383 @@ mod tests {
         assert_eq!(e.file, 1);
     }
 }
+
+/// The Lean namespace of a crate: `[package.metadata.djinn] namespace`, else
+/// the crate's name with its first letter upper-cased and `-` as `_`. Shared
+/// by `cargo djinn` and the build gate, which must agree on where the proofs are.
+pub fn namespace(configured: Option<&str>, crate_name: &str) -> String {
+    if let Some(ns) = configured {
+        return ns.to_string();
+    }
+    let mut c = crate_name.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+    .replace('-', "_")
+}
+
+/// The files a verification attests, besides the specification, and their
+/// fingerprint (see `evidence`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evidence {
+    /// The files, sorted by `rel`.
+    pub files: Vec<std::path::PathBuf>,
+    /// What `report.toml` records as `run.evidence`: the line
+    /// `fnv1a64v2:<hash of everything>:<count>`, then one line per file,
+    /// `<hash of its bytes> <path relative to the crate, with '/'>`.
+    pub record: String,
+}
+
+/// The Lean files `cargo djinn translate` regenerates in `<proofs>/<ns>/`.
+pub const GENERATED_LEAN: &[&str] = &["Spec.lean", "Obligations.lean", "Statements.lean", "Audit.lean", "Vocab.lean", "Tables.lean"];
+
+/// The evidence of a crate: every file under the solution directory, and every
+/// file of the Lean project `proofs` (lakefile, toolchain, manifest, root
+/// module, the implementer's proofs) except Lake's `.lake/` and what `cargo
+/// djinn` regenerates (`<ns>/Code/` and `GENERATED_LEAN` in `<ns>/`). No file
+/// is skipped for its name (dotfiles and editor backups count). An error —
+/// and so a refused build — for a symbolic link or other non-regular file, a
+/// path that is not UTF-8 or holds a newline, an unreadable file, and solution
+/// sources that pull in files from outside the solution directory
+/// (`#[path]`, `include!`, `include_str!`, `include_bytes!`; see
+/// `solution_escapes`).
+pub fn evidence(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> Result<Evidence, String> {
+    // paths in messages relative to the crate, as in the fingerprint
+    evidence_abs(crate_dir, solution, proofs, ns).map_err(|e| e.replace(&format!("{}/", crate_dir.display()), ""))
+}
+
+fn evidence_abs(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> Result<Evidence, String> {
+    fn walk(d: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+        let rd = match fs::read_dir(d) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("{}: {e}", d.display())),
+        };
+        for e in rd {
+            let e = e.map_err(|e| format!("{}: {e}", d.display()))?;
+            let p = e.path();
+            if skip(&p) {
+                continue;
+            }
+            // the entry itself, never what a link points to: no cycles, and
+            // nothing outside the tree counts as inside it
+            let t = e.file_type().map_err(|e| format!("{}: {e}", p.display()))?;
+            if t.is_symlink() {
+                return Err(format!("{} is a symbolic link; the verified files must be ordinary files", p.display()));
+            } else if t.is_dir() {
+                walk(&p, skip, out)?;
+            } else if t.is_file() {
+                out.push(p);
+            } else {
+                return Err(format!("{} is not an ordinary file", p.display()));
+            }
+        }
+        Ok(())
+    }
+    // a link as the directory itself is refused too
+    for d in [solution, proofs] {
+        if fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{} is a symbolic link; the verified files must be ordinary files", d.display()));
+        }
+    }
+    let mut files = Vec::new();
+    walk(solution, &|_| false, &mut files)?;
+    let lean = proofs.join(ns);
+    let (lake, code) = (proofs.join(".lake"), lean.join("Code"));
+    // the solution may lie inside the Lean project (a `proofs` setting): not twice
+    walk(
+        proofs,
+        &|p: &Path| p == lake || p == code || p == solution || (p.parent() == Some(lean.as_path()) && GENERATED_LEAN.iter().any(|g| p.file_name().is_some_and(|n| n == *g))),
+        &mut files,
+    )?;
+    let mut rel: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for f in files {
+        let r = rel_slash(f.strip_prefix(crate_dir).unwrap_or(&f)).ok_or_else(|| format!("{}: the path is not UTF-8 or holds a newline", f.display()))?;
+        rel.push((r, f));
+    }
+    rel.sort();
+    rel.dedup();
+    let mut record_lines = Vec::new();
+    let mut h = Fnv::new();
+    for (r, f) in &rel {
+        let bytes = fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        if f.starts_with(solution) && f.extension().is_some_and(|x| x == "rs") {
+            solution_escapes(solution, f, &bytes)?;
+        }
+        h.eat(r.as_bytes());
+        h.eat(&[0]);
+        h.eat(&bytes);
+        h.eat(&[0xff]);
+        let mut one = Fnv::new();
+        one.eat(&bytes);
+        record_lines.push(format!("{:016x} {r}", one.0));
+    }
+    let mut record = format!("fnv1a64v2:{:016x}:{}", h.0, rel.len());
+    for l in record_lines {
+        record.push('\n');
+        record.push_str(&l);
+    }
+    Ok(Evidence { files: rel.into_iter().map(|(_, f)| f).collect(), record })
+}
+
+/// `evidence`'s record, or `invalid: <why>` (which no recomputation matches).
+pub fn evidence_record(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> String {
+    match evidence(crate_dir, solution, proofs, ns) {
+        Ok(e) => e.record,
+        Err(e) => format!("invalid: {e}"),
+    }
+}
+
+/// A relative path as `a/b/c` whatever the platform's separator.
+fn rel_slash(p: &Path) -> Option<String> {
+    let parts: Option<Vec<&str>> = p.components().map(|c| c.as_os_str().to_str()).collect();
+    let s = parts?.join("/");
+    (!s.contains('\n') && !s.contains('\r')).then_some(s)
+}
+
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf29ce484222325)
+    }
+    fn eat(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= *b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+/// Does a solution source pull in a file from outside the solution directory?
+/// rustc resolves `#[path = "…"]` and `include!("…")` (`include_str!`,
+/// `include_bytes!`) against the file's directory — or a directory below it,
+/// for a module inside inline modules — so a relative path that never climbs
+/// above `solution` from the file's directory stays inside on every reading.
+/// Fail closed: an absolute path, a path that is not a string literal (built
+/// by a macro, say), a renamed `include` (`use std::include as inc`) and a
+/// file that does not lex are refused.
+pub fn solution_escapes(solution: &Path, file: &Path, bytes: &[u8]) -> Result<(), String> {
+    let shown = file.display();
+    let src = std::str::from_utf8(bytes).map_err(|_| format!("{shown}: not UTF-8"))?;
+    let ts: TokenStream = src.parse().map_err(|_| format!("{shown}: cannot be read as Rust tokens"))?;
+    let depth = file.parent().and_then(|d| d.strip_prefix(solution).ok()).map(|d| d.components().count() as i64).ok_or_else(|| format!("{shown}: not in {}", solution.display()))?;
+    let inside = |lit: Option<&TokenTree>, what: &str| -> Result<(), String> {
+        let value = lit.and_then(|t| match t {
+            TokenTree::Literal(l) => syn::parse_str::<syn::LitStr>(&l.to_string()).ok().map(|s| s.value()),
+            _ => None,
+        });
+        let Some(v) = value else {
+            return Err(format!("{shown}: {what} without a string literal path; the solution may only use files inside {}", solution.display()));
+        };
+        let mut d = depth;
+        for c in Path::new(&v).components() {
+            match c {
+                std::path::Component::Normal(_) => d += 1,
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => d -= 1,
+                _ => d = -1,
+            }
+            if d < 0 {
+                return Err(format!("{shown}: {what} \"{v}\" reaches outside {}; the verified solution must be self-contained", solution.display()));
+            }
+        }
+        Ok(())
+    };
+    fn scan(ts: TokenStream, in_attr: bool, inside: &dyn Fn(Option<&TokenTree>, &str) -> Result<(), String>) -> Result<(), String> {
+        let trees: Vec<TokenTree> = ts.into_iter().collect();
+        for (i, t) in trees.iter().enumerate() {
+            let next = |k: usize| trees.get(i + k);
+            let is_punct = |t: Option<&TokenTree>, c: char| matches!(t, Some(TokenTree::Punct(p)) if p.as_char() == c);
+            match t {
+                TokenTree::Ident(id) if id == "include" || id == "include_str" || id == "include_bytes" => {
+                    let what = format!("`{id}!`");
+                    let args: Option<Vec<TokenTree>> = match (is_punct(next(1), '!'), next(2)) {
+                        (true, Some(TokenTree::Group(g))) => Some(g.stream().into_iter().collect()),
+                        _ => None,
+                    };
+                    match args {
+                        Some(a) if a.len() == 1 || (a.len() == 2 && is_punct(a.get(1), ',')) => inside(a.first(), &what)?,
+                        _ => inside(None, &what)?,
+                    }
+                }
+                TokenTree::Ident(id) if in_attr && id == "path" && is_punct(next(1), '=') => inside(next(2), "`#[path]`")?,
+                TokenTree::Group(g) => {
+                    // `#[…]` and `#![…]`: an attribute
+                    let attr = g.delimiter() == Delimiter::Bracket && i >= 1 && (is_punct(trees.get(i - 1), '#') || (i >= 2 && is_punct(trees.get(i - 1), '!') && is_punct(trees.get(i - 2), '#')));
+                    scan(g.stream(), in_attr || attr, inside)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    scan(ts, false, &inside)
+}
+
+/// How the files on disk compare with a report's `run.evidence`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvidenceCheck {
+    Same,
+    /// The report records no fingerprint (written before fingerprints existed,
+    /// or by a verify that stopped early).
+    Unrecorded,
+    /// The report's fingerprint is of an older definition (`fnv1a64:…`).
+    Outdated,
+    /// The files differ: per file `changed: …` / `added: …` / `removed: …`
+    /// (empty when the recorded fingerprint has no per-file lines).
+    Changed(Vec<String>),
+    /// The files cannot be fingerprinted (see `evidence`).
+    Invalid(String),
+}
+
+pub fn check_evidence(recorded: &str, current: &Result<Evidence, String>) -> EvidenceCheck {
+    let cur = match current {
+        Ok(e) => e,
+        Err(e) => return EvidenceCheck::Invalid(e.clone()),
+    };
+    if recorded.trim().is_empty() {
+        return EvidenceCheck::Unrecorded;
+    }
+    if recorded == cur.record {
+        return EvidenceCheck::Same;
+    }
+    if !recorded.starts_with("fnv1a64v2:") {
+        return EvidenceCheck::Outdated;
+    }
+    let files = |r: &str| -> std::collections::BTreeMap<String, String> { r.lines().skip(1).filter_map(|l| l.split_once(' ')).map(|(h, p)| (p.to_string(), h.to_string())).collect() };
+    let (old, new) = (files(recorded), files(&cur.record));
+    let mut diff = Vec::new();
+    if recorded.lines().count() > 1 {
+        for (p, h) in &new {
+            match old.get(p) {
+                None => diff.push(format!("added: {p}")),
+                Some(o) if o != h => diff.push(format!("changed: {p}")),
+                _ => {}
+            }
+        }
+        diff.extend(old.keys().filter(|p| !new.contains_key(*p)).map(|p| format!("removed: {p}")));
+    }
+    EvidenceCheck::Changed(diff)
+}
+
+impl EvidenceCheck {
+    /// One line for humans; `None` when the files are the verified ones.
+    pub fn message(&self) -> Option<String> {
+        match self {
+            EvidenceCheck::Same => None,
+            EvidenceCheck::Unrecorded => Some("no evidence fingerprint recorded: run `cargo djinn verify`".into()),
+            EvidenceCheck::Outdated => Some("the evidence fingerprint is of an older `cargo djinn`: run `cargo djinn verify`".into()),
+            EvidenceCheck::Changed(d) if d.is_empty() => Some("stale: solution/proofs changed since verify".into()),
+            EvidenceCheck::Changed(d) => {
+                let more = if d.len() > 8 { format!(", and {} more", d.len() - 8) } else { String::new() };
+                Some(format!("stale: solution/proofs changed since verify ({}{more})", d.iter().take(8).cloned().collect::<Vec<_>>().join(", ")))
+            }
+            EvidenceCheck::Invalid(e) => Some(format!("the solution/proofs cannot be fingerprinted: {e}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("djinn-evidence-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("djinn/solution")).unwrap();
+        fs::create_dir_all(d.join("djinn/proofs/NS/Code")).unwrap();
+        fs::create_dir_all(d.join("djinn/proofs/.lake/build")).unwrap();
+        fs::write(d.join("djinn/solution/mod.rs"), "pub fn f() {}\n").unwrap();
+        fs::write(d.join("djinn/proofs/NS/Proofs.lean"), "-- p\n").unwrap();
+        fs::write(d.join("djinn/proofs/NS/Spec.lean"), "-- generated\n").unwrap();
+        fs::write(d.join("djinn/proofs/NS/Code/Funs.lean"), "-- generated\n").unwrap();
+        fs::write(d.join("djinn/proofs/.lake/build/x.olean"), "o").unwrap();
+        fs::write(d.join("djinn/proofs/lakefile.lean"), "import Lake\n").unwrap();
+        d
+    }
+    fn ev(d: &Path) -> Result<Evidence, String> {
+        evidence(d, &d.join("djinn/solution"), &d.join("djinn/proofs"), "NS")
+    }
+    fn rels(e: &Evidence) -> Vec<String> {
+        e.record.lines().skip(1).map(|l| l.split_once(' ').unwrap().1.to_string()).collect()
+    }
+
+    #[test]
+    fn covered_files() {
+        let d = tmp("covered");
+        let e = ev(&d).unwrap();
+        // the lakefile counts; generated files, Code/ and .lake/ do not
+        assert_eq!(rels(&e), ["djinn/proofs/NS/Proofs.lean", "djinn/proofs/lakefile.lean", "djinn/solution/mod.rs"]);
+        for (f, what) in [("djinn/solution/.hidden.rs", "dotfile"), ("djinn/solution/mod.rs~", "backup"), ("djinn/proofs/lean-toolchain", "toolchain"), ("djinn/proofs/lake-manifest.json", "manifest"), ("djinn/proofs/NS.lean", "root module"), ("djinn/proofs/NS/.Proofs.lean.swp", "swap file")] {
+            let before = ev(&d).unwrap();
+            fs::write(d.join(f), "x").unwrap();
+            let after = ev(&d).unwrap();
+            assert_ne!(before.record, after.record, "{what}");
+            assert_eq!(check_evidence(&before.record, &Ok(after)), EvidenceCheck::Changed(vec![format!("added: {f}")]), "{what}");
+        }
+        let before = ev(&d).unwrap();
+        fs::write(d.join("djinn/proofs/lakefile.lean"), "import Lake -- changed\n").unwrap();
+        assert_eq!(check_evidence(&before.record, &ev(&d)), EvidenceCheck::Changed(vec!["changed: djinn/proofs/lakefile.lean".into()]));
+        // regenerated files do not
+        let before = ev(&d).unwrap();
+        fs::write(d.join("djinn/proofs/NS/Spec.lean"), "-- regenerated\n").unwrap();
+        fs::write(d.join("djinn/proofs/NS/Code/Funs.lean"), "-- regenerated\n").unwrap();
+        assert_eq!(check_evidence(&before.record, &ev(&d)), EvidenceCheck::Same);
+        assert_eq!(check_evidence("", &ev(&d)), EvidenceCheck::Unrecorded);
+        // an old-format fingerprint
+        assert_eq!(check_evidence("fnv1a64:0123456789abcdef:2", &ev(&d)), EvidenceCheck::Outdated);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn symlinks_refused() {
+        let d = tmp("links");
+        std::os::unix::fs::symlink(d.join("djinn"), d.join("djinn/solution/loop")).unwrap();
+        assert!(ev(&d).unwrap_err().contains("symbolic link"));
+        let _ = fs::remove_dir_all(&d);
+        let d = tmp("links2");
+        std::os::unix::fs::symlink("/etc/hostname", d.join("djinn/proofs/NS/Extra.lean")).unwrap();
+        assert!(ev(&d).unwrap_err().contains("symbolic link"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn escapes() {
+        let sol = Path::new("/c/djinn/solution");
+        let ok = |f: &str, src: &str| solution_escapes(sol, &sol.join(f), src.as_bytes());
+        assert!(ok("mod.rs", "#[path = \"a/b.rs\"] mod b; const X: &str = include_str!(\"t.txt\");").is_ok());
+        assert!(ok("sub/mod.rs", "#[path = \"../x.rs\"] mod x; const T: &[u8] = include_bytes!(\"../t.bin\",);").is_ok());
+        assert!(ok("mod.rs", "fn f(path: u32) { let path = 1; }").is_ok());
+        for (f, src) in [
+            ("mod.rs", "#[path = \"../outside.rs\"] mod o;"),
+            ("mod.rs", "#[cfg_attr(all(), path = \"../../src/x.rs\")] mod o;"),
+            ("sub/a.rs", "mod m { #[path = \"../../x.rs\"] mod o; }"),
+            ("mod.rs", "#[path = \"/etc/x.rs\"] mod o;"),
+            ("mod.rs", "include!(\"../x.rs\");"),
+            ("mod.rs", "const S: &str = include_str!(concat!(env!(\"HOME\"), \"/x\"));"),
+            ("mod.rs", "#[doc = include_str!(\"../../README.md\")] pub fn f() {}"),
+            ("mod.rs", "use core::include as inc;"),
+            ("mod.rs", "macro_rules! m { ($p:literal) => { std::include!($p) } }"),
+            ("mod.rs", "#![path = \"../x\"]"),
+        ] {
+            assert!(ok(f, src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn escape_refuses_the_fingerprint() {
+        let d = tmp("escape");
+        fs::write(d.join("djinn/solution/mod.rs"), "#[path = \"../../outside.rs\"] mod outside;\n").unwrap();
+        assert!(ev(&d).unwrap_err().contains("reaches outside"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn namespaces() {
+        assert_eq!(namespace(None, "my-crate"), "My_crate");
+        assert_eq!(namespace(Some("X"), "my-crate"), "X");
+    }
+}

@@ -25,7 +25,7 @@ pub struct EmitCx<'a> {
 
 fn binders(cx: &EmitCx, vars: &[(String, RType)], view: bool) -> String {
     vars.iter()
-        .map(|(n, t)| format!("({n} : {})", if view { view_type(t, cx.type_names) } else { aeneas_type(t, cx.type_names) }))
+        .map(|(n, t)| format!("({} : {})", lean_ident(n), if view { view_type(t, cx.type_names) } else { aeneas_type(t, cx.type_names) }))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -40,7 +40,7 @@ fn sp(s: &str) -> String {
 }
 
 fn names(vars: &[(String, RType)]) -> String {
-    vars.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>().join(" ")
+    vars.iter().map(|(n, _)| lean_ident(n)).collect::<Vec<_>>().join(" ")
 }
 
 /// The implementer's choices as Lean binders (their types are already Lean).
@@ -88,12 +88,26 @@ pub fn spec_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
     s.push_str("    Every Rust parameter appears here in its mathematical view:\n");
     s.push_str("    sequences as `List`, numbers compared through `.val : ℤ`.\n");
     s.push_str("    The Aeneas types reappear only in the `impl_correct` obligations. -/\n");
-    s.push_str(&format!("import Aeneas\nimport {}.Vocab\n{}\nopen Aeneas Std Result\n\n", cx.ns, types_import(cx, decls)));
-    s.push_str("set_option linter.unusedSimpArgs false\nset_option linter.unusedVariables false\nset_option linter.unusedTactic false\n\n");
+    let tables = if decls.iter().any(|d| !d.tables.is_empty()) { format!("import {}.Tables\n", cx.ns) } else { String::new() };
+    s.push_str(&format!("import Aeneas\nimport {}.Vocab\n{tables}{}\nopen Aeneas Std Result\n\n", cx.ns, types_import(cx, decls)));
+    s.push_str("set_option linter.unusedSimpArgs false\nset_option linter.unusedVariables false\nset_option linter.unusedTactic false\n");
+    // long relations elaborate slowly: Aeneas's own limit
+    s.push_str("set_option maxHeartbeats 1000000\n\n");
+    // a proposition used as a `bool` is `decide P`: when `P` has no decidability
+    // instance of its own (an existential over a relation), the classical one,
+    // at low priority, so it never displaces a real instance
+    s.push_str("open scoped Classical\n\n");
     // `l[i]!` on a list of a user type needs `Inhabited`; Aeneas derives nothing
     if cx.has_types {
+        // each type after the types its fields contain: deriving `Inhabited`
+        // for a structure needs its fields' instances
         let mut named: Vec<String> = Vec::new();
         for d in decls {
+            for n in &d.named_types {
+                if !named.contains(n) {
+                    named.push(n.clone());
+                }
+            }
             for (_, t) in d.inputs.iter().chain(d.outputs.iter()) {
                 collect_named(t, &mut named);
             }
@@ -139,9 +153,9 @@ pub fn spec_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
         ));
         if recursive {
             let measure = if d.decreases.len() == 1 {
-                format!("({}).toNat", d.decreases[0])
+                format!("({} : ℤ).toNat", d.decreases[0])
             } else {
-                format!("({})", d.decreases.iter().map(|m| format!("({m}).toNat")).collect::<Vec<_>>().join(", "))
+                format!("({})", d.decreases.iter().map(|m| format!("({m} : ℤ).toNat")).collect::<Vec<_>>().join(", "))
             };
             let unfold: Vec<&String> = defined.iter().filter(|n| cx.unfoldable.contains(n)).collect();
             let unfold = if unfold.is_empty() { String::new() } else { format!(" (try simp only [{}] at *);", unfold.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(", ")) };
@@ -150,7 +164,7 @@ pub fn spec_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
                 // first without unfolding the callees' relations: the spelled-out
                 // precondition and the guards are usually enough, and a smaller
                 // context keeps omega out of trouble; then with everything unfolded
-                "termination_by {measure}\ndecreasing_by all_goals (simp_wf; first | ((try simp only [{lens}] at *); omega) | ({unfold} (try simp only [{lens}] at *); omega))\n"
+                "termination_by {measure}\ndecreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [{lens}] at *); omega) | ({unfold} (try simp only [{lens}] at *); omega))\n"
             ));
         }
         if !d.choices.is_empty() {
@@ -181,6 +195,122 @@ pub fn spec_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
 }
 
 /// `import NS.Code.Funs` once an Aeneas model exists; nothing before.
+/// A table of the specification files: its name, its sequence type
+/// (`&[T]` or `[T; N]` of an integer type) and its elements in decimal.
+pub struct Table {
+    pub name: String,
+    pub ty: RType,
+    pub elems: Vec<String>,
+}
+
+impl Table {
+    /// Element signedness and width; `usize`/`isize` entries are packed as 64 bits.
+    fn elem(&self) -> (bool, u32, u32) {
+        match &self.ty {
+            RType::Seq(e, _) => match **e {
+                RType::Int { signed, bits } => (signed, bits, if bits == 0 { 64 } else { bits }),
+                _ => unreachable!("tables hold integers"),
+            },
+            _ => unreachable!("tables are sequences"),
+        }
+    }
+    /// The Aeneas element type, and the width of its `BitVec`.
+    fn elem_lean(&self) -> (String, String) {
+        let (signed, bits, _) = self.elem();
+        let ty = aeneas_type(&RType::Int { signed, bits }, &TypeNames::new());
+        let w = match (bits, signed) {
+            (0, false) => "UScalarTy.Usize.numBits".to_string(),
+            (0, true) => "IScalarTy.Isize.numBits".to_string(),
+            (b, _) => b.to_string(),
+        };
+        (ty, w)
+    }
+}
+
+/// Entries packed into one number of a table's packed list: numbers of about
+/// 16 kbit keep Lean's numeral elaboration fast (it is quadratic in the
+/// length of one numeral).
+fn per_chunk(bits: u32) -> usize {
+    (16384 / bits as usize).max(1)
+}
+
+/// The hexadecimal numeral of entries `vals` (`bits` each, entry 0 lowest).
+fn packed_numeral(vals: &[String], bits: u32) -> String {
+    let digits = (bits / 4) as usize;
+    let mask: u128 = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+    let mut hex = String::with_capacity(vals.len() * digits);
+    for v in vals.iter().rev() {
+        let n: u128 = if let Some(p) = v.strip_prefix('-') {
+            (p.parse::<u128>().expect("table literal").wrapping_neg()) & mask
+        } else {
+            v.parse::<u128>().expect("table literal") & mask
+        };
+        hex.push_str(&format!("{n:0digits$x}"));
+    }
+    let t = hex.trim_start_matches('0');
+    if t.is_empty() { "0".into() } else { format!("0x{t}") }
+}
+
+/// `Tables.lean`: every table of the specification files, as a `List` of
+/// Aeneas scalars decoded from a packed form, with its length and an
+/// indexing lemma. Trusted, like `Spec.lean`: `Spec.lean` uses the tables,
+/// and the model library defines the Rust constants as these lists. A Lean
+/// `module`, so that the models (which are one) may import it.
+pub fn tables_lean(ns: &str, tables: &[Table]) -> String {
+    let mut s = String::new();
+    s.push_str("/-  Tables.lean — generated by `cargo djinn`. TRUSTED: do not edit.\n");
+    s.push_str("    The array constants of the specification files. Each is a `List` of\n");
+    s.push_str("    Aeneas scalars, decoded from numbers that pack the entries (Lean\n");
+    s.push_str("    elaborates a list of thousands of scalar literals far too slowly);\n");
+    s.push_str("    `K_length` and `K_getElem!` are what proofs need (`K` itself is\n");
+    s.push_str("    irreducible past them; `K_entry i` evaluates by `decide`). The Rust constants\n");
+    s.push_str("    are modeled as these same lists (`Code/FunsExternal.lean`). -/\n");
+    s.push_str("module\npublic import Aeneas\n@[expose] public section\nopen Aeneas Std Result\n\n");
+    s.push_str(&format!("namespace {ns}.Spec\n\n"));
+    for t in tables {
+        let (_, _, bits) = t.elem();
+        let (ty, w) = t.elem_lean();
+        let n = t.elems.len();
+        let c = per_chunk(bits);
+        let name = &t.name;
+        let chunks: Vec<String> = t.elems.chunks(c).map(|ch| packed_numeral(ch, bits)).collect();
+        s.push_str(&format!("/-! ## const {name}: {n} entries of {bits} bits -/\n\n"));
+        s.push_str(&format!("/-- `{name}` packed, {c} entries to a number: entry `i` is bits `{bits} * (i % {c})` up of number `i / {c}`. -/\n"));
+        if chunks.is_empty() {
+            s.push_str(&format!("def {name}_packed : List Nat := []\n\n"));
+        } else {
+            s.push_str(&format!("def {name}_packed : List Nat := [\n  {}]\n\n", chunks.join(",\n  ")));
+        }
+        s.push_str(&format!("def {name}_entry (i : Nat) : Nat := ({name}_packed.getD (i / {c}) 0 >>> ({bits} * (i % {c}))) % 2 ^ {bits}\n\n"));
+        s.push_str(&format!("def {name} : List {ty} := (List.range {n}).map (fun i => ⟨BitVec.ofNat {w} ({name}_entry i)⟩)\n\n"));
+        s.push_str(&format!("@[simp] theorem {name}_length : {name}.length = {n} := by simp [{name}]\n\n"));
+        // (an empty table has no index: `simp` cannot reach the vacuous goal)
+        let proof = if n == 0 { "exact absurd h (Nat.not_lt_zero i)".to_string() } else { format!("simp [{name}, h]") };
+        s.push_str(&format!("theorem {name}_getElem! (i : Nat) (h : i < {n}) : {name}[i]! = ⟨BitVec.ofNat {w} ({name}_entry i)⟩ := by\n  {proof}\n\n"));
+        // from here on the table is known through its lemmas only: no tactic
+        // may unfold a list of thousands of entries by accident
+        s.push_str(&format!("attribute [irreducible] {name}\n\n"));
+    }
+    s.push_str(&format!("end {ns}.Spec\n"));
+    s
+}
+
+/// The model of a table's Rust constant (an opaque global for Aeneas, at
+/// Lean name `lean`): the list of `Tables.lean`.
+pub fn table_model(ns: &str, lean: &str, t: &Table) -> String {
+    let (ty, _) = t.elem_lean();
+    let n = t.elems.len();
+    let name = &t.name;
+    match &t.ty {
+        RType::Seq(_, SeqKind::Array(_)) => format!(
+            "def {lean} : Result (Array Std.{ty} {n}#usize) :=\n  ok (Array.make {n}#usize {ns}.Spec.{name} (by simp [{ns}.Spec.{name}_length]))\n"
+        ),
+        _ => format!(
+            "def {lean} : Result (Slice Std.{ty}) :=\n  ok (Slice.from {ns}.Spec.{name} (by simp only [{ns}.Spec.{name}_length]; scalar_tac))\n"
+        ),
+    }
+}
+
 pub fn code_import(cx: &EmitCx) -> String {
     if cx.impl_names.is_empty() {
         String::new()
@@ -218,8 +348,10 @@ pub struct Obligation {
 /// The short names an obligation may have (for recognizing theorems in `Proofs.lean`).
 pub const OBLIGATION_KINDS: &[&str] = &["unambiguous", "wf", "impl_correct", "exists"];
 
+/// Exactly an obligation's short name: one of `OBLIGATION_KINDS`, or `ens_<i>`
+/// (a helper `f.ens_bound` is no obligation).
 pub fn is_obligation_kind(ob: &str) -> bool {
-    OBLIGATION_KINDS.contains(&ob) || ob.starts_with("ens_")
+    OBLIGATION_KINDS.contains(&ob) || ob.strip_prefix("ens_").is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()) && (i == "0" || !i.starts_with('0')))
 }
 
 pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
@@ -297,7 +429,7 @@ pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
         let impl_name = cx.impl_names.get(&d.name).cloned().unwrap_or_else(|| format!("{}.{}", cx.ns, d.name));
         let params = binders(cx, &d.impl_params, false);
         let pnames = names(&d.impl_params);
-        let in_views: Vec<String> = d.impl_params.iter().map(|(n, t)| view_of(n, t)).collect();
+        let in_views: Vec<String> = d.impl_params.iter().map(|(n, t)| view_of(&lean_ident(n), t)).collect();
         let outs: Vec<(String, RType)> = {
             let mut o = Vec::new();
             let ret = d.outputs.iter().find(|(n, _)| !d.impl_params.iter().any(|(p, _)| p == n));
@@ -306,12 +438,15 @@ pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
             }
             for (n, t) in &d.impl_params {
                 if d.outputs.iter().any(|(on, _)| on == n) {
+                    // `n'`: no Rust identifier (no parameter, no output) has a `'`, so
+                    // nothing in scope is shadowed; `lean_ident` escapes it where
+                    // needed (`end'` is an identifier, `«λ'»` too; `«end»'` is not)
                     o.push((format!("{n}'"), t.clone()));
                 }
             }
             o
         };
-        let out_views: Vec<String> = outs.iter().map(|(n, t)| view_of(n, t)).collect();
+        let out_views: Vec<String> = outs.iter().map(|(n, t)| view_of(&lean_ident(n), t)).collect();
         v.push(Obligation {
             name: format!("{}.impl_correct", d.name),
             doc: "GUARANTEE: the implementation meets the relation, TERMINATES and NEVER\n    PANICS, unconditionally on the precondition domain. The bracket `⦃ ⦄` is\n    `Aeneas.Std.WP.spec`, which is inhabited only by `ok`.".into(),
@@ -326,7 +461,7 @@ pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
             generated_proof: None,
         });
         // existence, derived
-        let ex_names: Vec<String> = outs.iter().map(|(n, _)| n.clone()).collect();
+        let ex_names: Vec<String> = outs.iter().map(|(n, _)| lean_ident(n)).collect();
         v.push(Obligation {
             name: format!("{}.exists", d.name),
             doc: "Existence for a func is derived mechanically from `impl_correct`\n    (the generator writes this proof; the implementer owes nothing).".into(),
@@ -338,10 +473,24 @@ pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
                 in_views.join(" "),
                 ex_names.join(" ")
             ),
-            generated_proof: Some(format!(
-                "by\n  intro {pnames} h_pre_\n  have h_impl_ := {}.impl_correct {pnames} h_pre_\n  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_\n  obtain ⟨_, _, h_post_⟩ := h_impl_\n  exact ⟨_, h_post_⟩",
-                d.name
-            )),
+            generated_proof: Some(if outs.len() <= 1 {
+                format!(
+                    "by\n  intro {pnames} h_pre_\n  have h_impl_ := {}.impl_correct {pnames} h_pre_\n  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_\n  obtain ⟨_, _, h_post_⟩ := h_impl_\n  exact ⟨_, h_post_⟩",
+                    d.name
+                )
+            } else {
+                // several outputs (a return value and `&mut` write-backs): Aeneas
+                // returns a tuple, and the postcondition is `WP.uncurry'` of it —
+                // take the tuple apart and give each output in its view
+                let xs: Vec<String> = (0..outs.len()).map(|k| format!("x_{k}_")).collect();
+                let views: Vec<String> = outs.iter().zip(&xs).map(|((_, t), x)| view_of(x, t)).collect();
+                format!(
+                    "by\n  intro {pnames} h_pre_\n  have h_impl_ := {}.impl_correct {pnames} h_pre_\n  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_\n  obtain ⟨⟨{}⟩, _, h_post_⟩ := h_impl_\n  exact ⟨{}, h_post_⟩",
+                    d.name,
+                    xs.join(", "),
+                    views.join(", ")
+                )
+            }),
         });
     } else if d.total {
         v.push(Obligation {
@@ -361,18 +510,48 @@ pub fn obligations_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
     s.push_str("    Each theorem below is PINNED by its type and takes its proof from\n");
     s.push_str(&format!("    `{}.Proofs` by name. The implementer may prove it any way, with any\n", cx.ns));
     s.push_str("    helpers, but cannot weaken it: if the type does not match, this file fails\n");
-    s.push_str("    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem\n");
-    s.push_str("    here against {propext, Classical.choice, Quot.sound}. -/\n");
-    s.push_str(&format!("import {0}.Spec\n{1}import {0}.Proofs\n\nopen Aeneas Std\nopen {0}.Spec\n\nnamespace {0}.Obligations\n\n", cx.ns, code_import(cx)));
+    s.push_str("    to elaborate. `Audit.lean` then checks every theorem here, outside the\n");
+    s.push_str("    reach of `Proofs`: its statement against `Statements.lean`, its proof in\n");
+    s.push_str("    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/\n");
+    s.push_str(&format!("import {0}.Spec\n{1}import {0}.Proofs\n\nopen Aeneas Std\nopen {0}.Spec\n\nset_option maxHeartbeats 1000000\n\nnamespace {0}.Obligations\n\n", cx.ns, code_import(cx)));
+    s.push_str(&obligation_decls(cx, decls, false));
+    s.push_str(&format!("end {}.Obligations\n", cx.ns));
+    s
+}
+
+/// The obligations as `Obligations.lean` declares them: theorems with their
+/// proofs, or (`reference`) axioms, for `Statements.lean`.
+fn obligation_decls(cx: &EmitCx, decls: &[Lowered], reference: bool) -> String {
+    let mut s = String::new();
     for d in decls {
         s.push_str(&format!("/-! ### {}  ({}{}) -/\n\n", d.name, d.kind.word(), if d.total { ", total" } else { "" }));
         for o in obligations(cx, d) {
+            if reference {
+                s.push_str(&format!("/-- {} -/\naxiom {} :\n    {}\n\n", o.doc, o.name, o.statement));
+                continue;
+            }
             s.push_str(&format!("/-- {} -/\ntheorem {} :\n    {} :=\n  {}\n\n", o.doc, o.name, o.statement, match &o.generated_proof {
                 Some(p) => p.clone(),
                 None => format!("{}.Proofs.{}", cx.ns, o.name),
             }));
         }
     }
+    s
+}
+
+/// `Statements.lean`: every obligation's statement as `Obligations.lean`
+/// states it — same namespace, opens and options — but elaborated without
+/// `Proofs` (an `axiom` each). `Proofs` is imported by `Obligations.lean`, so
+/// its macros, elaborators and instances could change what a statement there
+/// means; the audit compares the two. Never imported by anything but the
+/// audit, which loads it apart from `Obligations`.
+pub fn statements_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
+    let mut s = String::new();
+    s.push_str("/-  Statements.lean — generated by `cargo djinn`. TRUSTED: do not edit.\n");
+    s.push_str("    The obligations of `Obligations.lean`, elaborated without `Proofs`: the\n");
+    s.push_str("    axiom audit requires each theorem there to state exactly this. -/\n");
+    s.push_str(&format!("import {0}.Spec\n{1}import {0}.Vocab\n\nopen Aeneas Std\nopen {0}.Spec\n\nset_option maxHeartbeats 1000000\n\nnamespace {0}.Obligations\n\n", cx.ns, code_import(cx)));
+    s.push_str(&obligation_decls(cx, decls, true));
     s.push_str(&format!("end {}.Obligations\n", cx.ns));
     s
 }
@@ -387,7 +566,7 @@ pub fn proofs_skeleton(cx: &EmitCx, decls: &[Lowered]) -> String {
     s.push_str("/-  Proofs.lean — the implementer's file. Written once by `cargo djinn\n");
     s.push_str("    translate`, never overwritten. Replace every `sorry`; add any helper\n");
     s.push_str("    lemmas you need (loop invariants, bridging lemmas) in this file. -/\n");
-    s.push_str(&format!("import Aeneas\nimport {0}.Spec\nimport {0}.Vocab\n{1}\nopen Aeneas Std Result\nopen {0}.Spec\nopen Djinn.Vocab\n\nnamespace {0}.Proofs\n\n", cx.ns, code_import(cx)));
+    s.push_str(&format!("import Aeneas\nimport {0}.Spec\nimport {0}.Vocab\n{1}\nopen Aeneas Std Result\nopen {0}.Spec\nopen Djinn.Vocab\n\nset_option maxHeartbeats 1000000\n\nnamespace {0}.Proofs\n\n", cx.ns, code_import(cx)));
     for d in decls {
         s.push_str(&format!("/-! ## {} -/\n\n", d.name));
         for o in obligations(cx, d) {
@@ -401,18 +580,186 @@ pub fn proofs_skeleton(cx: &EmitCx, decls: &[Lowered]) -> String {
     s
 }
 
-pub fn audit_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
-    let mut s = String::new();
-    s.push_str("/-  Audit.lean — generated; `cargo djinn verify` runs it and accepts only\n");
-    s.push_str("    propext, Classical.choice and Quot.sound. -/\n");
-    s.push_str(&format!("import {}.Obligations\n\n", cx.ns));
-    for d in decls {
-        for o in obligations(cx, d) {
-            s.push_str(&format!("#print axioms {}.Obligations.{}\n", cx.ns, o.name));
-        }
-    }
-    s
+/// The obligations' full Lean names, in the order `Audit.lean` reports them.
+pub fn audit_names(cx: &EmitCx, decls: &[Lowered]) -> Vec<String> {
+    decls.iter().flat_map(|d| obligations(cx, d)).map(|o| format!("{}.Obligations.{}", cx.ns, o.name)).collect()
 }
+
+/// A Lean term for the name with these dot-separated components, built from
+/// string literals (no identifier syntax to escape).
+fn name_term(dotted: &str) -> String {
+    let parts: Vec<String> = dotted.split('.').map(|c| format!("\"{}\"", c.replace('\\', "\\\\").replace('"', "\\\""))).collect();
+    format!("nm [{}]", parts.join(", "))
+}
+
+/// `Audit.lean`: a program (`lean --run`) that judges every obligation from
+/// the built `.olean` files without elaborating anything `Proofs` defines —
+/// it imports only `Lean`, and loads the environments as data (no
+/// initializers, no environment extensions), so no macro, elaborator or
+/// instance of `Proofs` is in play. Per obligation, in order, one line
+/// `djinn-audit <i> ok|sorry|axioms <names>|statement <why>`; then
+/// `djinn-audit replay ok <n>` or `djinn-audit replay fail <why>`; then
+/// `djinn-audit end <count>`. It checks that
+/// - the theorem is declared by `Obligations.lean` and states exactly what
+///   `Statements.lean` (elaborated without `Proofs`) states;
+/// - its axioms, collected from the constants themselves, are among
+///   propext, Classical.choice and Quot.sound (by exact name);
+/// - the kernel accepts again every constant of this package's modules the
+///   obligations reach (replayed onto the trusted imports alone: a
+///   declaration added past the kernel, `debug.skipKernelTC` say, fails).
+pub fn audit_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
+    let names = audit_names(cx, decls);
+    let list: Vec<String> = names.iter().map(|n| format!("  {}", name_term(n))).collect();
+    AUDIT_TEMPLATE
+        .replace("@NS@", &name_term(cx.ns))
+        .replace("@OWNER@", &name_term(&format!("{}.Obligations", cx.ns)))
+        .replace("@REFERENCE@", &name_term(&format!("{}.Statements", cx.ns)))
+        .replace("@OBLIGATIONS@", &list.join(",\n"))
+}
+
+const AUDIT_TEMPLATE: &str = r#"/-  Audit.lean — generated; `cargo djinn verify` runs it (`lake env lean --run`)
+    after `lake build`. It imports only `Lean` and reads the built modules as
+    data, so nothing `Proofs` defines takes part. Per obligation: declared by
+    `Obligations.lean` with the statement `Statements.lean` elaborates without
+    `Proofs`; only propext, Classical.choice and Quot.sound as axioms; and
+    every constant of this package it reaches checked again by the kernel. -/
+import Lean
+open Lean
+
+namespace Djinn.Audit
+
+def nm (cs : List String) : Name := cs.foldl Name.mkStr .anonymous
+
+def ns : Name := @NS@
+def owner : Name := @OWNER@
+def reference : Name := @REFERENCE@
+
+def obligations : Array Name := #[
+@OBLIGATIONS@]
+
+def allowed : Array Name := #[nm ["propext"], nm ["Classical", "choice"], nm ["Quot", "sound"]]
+
+abbrev EnvM := ReaderT Environment Id
+
+instance : MonadEnv EnvM where
+  getEnv := read
+  modifyEnv _ := pure ()
+
+def moduleOf (env : Environment) (n : Name) : Option Name :=
+  (env.getModuleIdxFor? n).bind fun i => env.header.moduleNames[i.toNat]?
+
+/-- One line of output, whatever a name holds. -/
+def clean (s : String) : String := s.map fun c => if c.toNat < 32 then ' ' else c
+
+def kernelParts : ConstantInfo → Option (String × List Name × Expr × Option Expr)
+  | .axiomInfo v => some ("axiom", v.levelParams, v.type, none)
+  | .defnInfo v => some ("def", v.levelParams, v.type, some v.value)
+  | .thmInfo v => some ("theorem", v.levelParams, v.type, some v.value)
+  | .opaqueInfo v => some ("opaque", v.levelParams, v.type, some v.value)
+  | _ => none
+
+/-- Is `o` a theorem of `Obligations.lean` stating what `Statements.lean` does?
+    Constants elaborated with the statement (`match` auxiliaries) are compared
+    too; every other constant it mentions must come from the same module. -/
+def sameStatement (env ref : Environment) (o : Name) : Except String Unit := do
+  let some (.thmInfo t) := env.find? o | throw "it is not a theorem"
+  if moduleOf env o != some owner then throw "it is not declared by Obligations.lean"
+  let some (.axiomInfo a) := ref.find? o | throw "it is missing from Statements.lean"
+  if t.levelParams != a.levelParams || !(t.type == a.type) then
+    throw "its statement differs from the one Statements.lean elaborates without the proofs (does Proofs change how it elaborates: a macro, an elaborator, an instance?)"
+  let mut todo := t.type.getUsedConstants.toList
+  let mut seen : NameSet := {}
+  repeat
+    match todo with
+    | [] => break
+    | k :: rest =>
+      todo := rest
+      if seen.contains k then continue
+      seen := seen.insert k
+      match moduleOf env k, moduleOf ref k with
+      | some m, some m' =>
+        if m == owner && m' == reference then
+          match (env.find? k).bind kernelParts, (ref.find? k).bind kernelParts with
+          | some (k1, l1, t1, v1), some (k2, l2, t2, v2) =>
+            if k1 != k2 || l1 != l2 || !(t1 == t2) || !(v1 == v2) then
+              throw s!"`{k}` in its statement differs"
+            todo := t1.getUsedConstants.toList ++ (v1.map (·.getUsedConstants.toList)).getD [] ++ todo
+          | _, _ => throw s!"`{k}` in its statement differs"
+        else if m != m' || m == owner then
+          throw s!"`{k}` in its statement comes from {m}, not {m'}"
+      | _, _ => throw s!"`{k}` in its statement is unknown"
+  return ()
+
+/-- The modules built from this package's sources (under `.lake/build`, or
+    in the namespace): what the kernel checks again. -/
+def untrustedModules (env : Environment) (build : String) : IO NameSet := do
+  let mut s : NameSet := {}
+  for m in env.header.moduleNames do
+    let p ← IO.FS.realPath (← findOLean m)
+    if p.toString.startsWith build || ns.isPrefixOf m then
+      s := s.insert m
+  return s
+
+/-- Replay the package's constants the obligations reach onto an environment
+    of the trusted modules they import; the number replayed. -/
+def replayUntrusted (env : Environment) (bad : NameSet) (roots : Array Name) : IO Nat := do
+  let isBad (n : Name) : Bool := match moduleOf env n with
+    | some m => bad.contains m
+    | none => true
+  let mut todo := roots.toList
+  let mut seen : NameSet := {}
+  let mut newC : Std.HashMap Name ConstantInfo := {}
+  repeat
+    match todo with
+    | [] => break
+    | k :: rest =>
+      todo := rest
+      if seen.contains k || !isBad k then continue
+      seen := seen.insert k
+      let some ci := env.find? k | throw <| IO.userError s!"unknown constant `{k}`"
+      newC := newC.insert k ci
+      todo := ci.getUsedConstantsAsSet.toList ++ todo
+      match ci with
+      | .inductInfo v => todo := v.all ++ v.ctors ++ todo
+      | .ctorInfo v => todo := v.induct :: todo
+      | .recInfo v => todo := v.all ++ todo
+      | _ => pure ()
+  let mut imps : Array Import := #[]
+  for m in env.header.moduleNames, d in env.header.moduleData do
+    if bad.contains m then
+      for i in d.imports do
+        if !bad.contains i.module && !imps.any (·.module == i.module) then
+          imps := imps.push { module := i.module }
+  let base ← importModules imps {}
+  discard <| base.replay newC
+  return newC.size
+
+end Djinn.Audit
+
+open Djinn.Audit in
+def main : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let env ← importModules #[{ module := owner }] {}
+  let ref ← importModules #[{ module := reference }] {}
+  for o in obligations, i in [0:obligations.size] do
+    match sameStatement env ref o with
+    | .error e => IO.println s!"djinn-audit {i} statement {clean e}"
+    | .ok () =>
+      let axs := ((collectAxioms o : EnvM (Array Name)).run env).filter (!allowed.contains ·)
+      if axs.contains (nm ["sorryAx"]) then IO.println s!"djinn-audit {i} sorry"
+      else if axs.isEmpty then IO.println s!"djinn-audit {i} ok"
+      else IO.println s!"djinn-audit {i} axioms {clean (", ".intercalate (axs.toList.map toString))}"
+  let build := (← IO.FS.realPath ((← IO.currentDir) / ".lake" / "build")).toString ++ "/"
+  -- the kernel recurses deeply on big proofs: on a thread of its own, whose
+  -- stack `--tstack` sizes (the main thread's is the OS's)
+  let bad ← untrustedModules env build
+  let t ← IO.asTask (prio := .dedicated) (replayUntrusted env bad obligations)
+  match t.get with
+  | .ok n => IO.println s!"djinn-audit replay ok {n}"
+  | .error e => IO.println s!"djinn-audit replay fail {clean (toString e)}"
+  IO.println s!"djinn-audit end {obligations.size}"
+  return 0
+"#;
 
 /// `Vocab.lean`: lemmas about the vocabulary's Lean models that proofs keep
 /// needing (DESIGN.md §8). Regenerated with the other trusted files; the
@@ -608,7 +955,124 @@ theorem memrchr_eq_some {n : U8} {l : List U8} {i : Nat} :
       rw [getElem!_pos l _ (by omega)] at hj
       simpa using hj
 
+/-- `v.extend_from_slice(s)`: Aeneas models it but states no `step` lemma.
+    With a clone that is the identity on `s` (every scalar's), the result is
+    `v ++ s`, and it does not panic while the length fits. Not a global
+    `@[step]` lemma (proofs that state their own would see two): use
+    `step with Djinn.Vocab.extend_from_slice_spec` or
+    `attribute [local step] Djinn.Vocab.extend_from_slice_spec`. -/
+theorem extend_from_slice_spec {T : Type} (cloneInst : core.clone.Clone T) (v : alloc.vec.Vec T) (s : Aeneas.Std.Slice T)
+    (hc : ∀ x ∈ s.val, cloneInst.clone x = ok x) (h : v.length + s.length ≤ Usize.max) :
+    alloc.vec.Vec.extend_from_slice cloneInst v s ⦃ r => r.val = v.val ++ s.val ⦄ := by
+  have hcl := Slice.clone_spec (clone := cloneInst.clone) hc
+  rw [WP.spec_equiv_exists] at hcl
+  obtain ⟨s', hs', hss⟩ := hcl
+  subst hss
+  unfold alloc.vec.Vec.extend_from_slice
+  rw [dif_pos h]
+  split
+  · rename_i s'' h'
+    simp [hs'] at h'
+    subst h'
+    simp
+  · rename_i h'
+    simp [hs'] at h'
+  · rename_i h'
+    simp [hs'] at h'
+
+/-- `slice.sort()`'s model: an insertion sort with Rust's `Ord::cmp`.
+    `insertM` puts `x` before the first element it is not greater than;
+    `sortM` inserts each element into the sorted rest of the list, so an
+    element ends up before the equal ones after it: the sort is stable. -/
+def insertM {T : Type} (cmp : T → T → Result Ordering) (x : T) : List T → Result (List T)
+  | [] => ok [x]
+  | y :: ys => do
+    let o ← cmp x y
+    if o ≠ .gt then ok (x :: y :: ys) else do
+      let r ← insertM cmp x ys
+      ok (y :: r)
+
+def sortM {T : Type} (cmp : T → T → Result Ordering) : List T → Result (List T)
+  | [] => ok []
+  | x :: xs => do
+    let s ← sortM cmp xs
+    insertM cmp x s
+
+/-- With a comparison that never fails, the model is Mathlib's insertion sort
+    by "not greater": sorted (`List.sorted_insertionSort`) and a permutation
+    (`List.perm_insertionSort`). -/
+theorem sortM_ok {T : Type} (f : T → T → Ordering) (l : List T) :
+    sortM (fun a b => ok (f a b)) l = ok (l.insertionSort (fun a b => f a b ≠ .gt)) := by
+  have hins : ∀ (x : T) (m : List T), insertM (fun a b => ok (f a b)) x m = ok (m.orderedInsert (fun a b => f a b ≠ .gt) x) := by
+    intro x m
+    induction m with
+    | nil => rw [insertM, List.orderedInsert_nil]
+    | cons y ys ih =>
+      rw [insertM, List.orderedInsert_cons]
+      by_cases h : f x y ≠ .gt
+      · simp [h]
+      · simp [h, ih]
+  induction l with
+  | nil => rw [sortM, List.insertionSort_nil]
+  | cons x xs ih => rw [sortM, List.insertionSort_cons, ih]; simp [hins]
+
 end Djinn.Vocab
 "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cx_with<'a>(impl_names: &'a HashMap<String, String>, tn: &'a TypeNames) -> EmitCx<'a> {
+        EmitCx { ns: "T", impl_names, type_names: tn, has_types: false, has_funs: true, unfoldable: vec![] }
+    }
+
+    #[test]
+    fn mut_outputs_get_a_name_no_parameter_has() {
+        // a `&mut` parameter named like a Lean keyword next to one named
+        // `<it>_post`: the final value used to be `end_post`, capturing the other
+        let p = crate::parse_program("djinn! { pub fn f(end: &mut u32, end_post: u32) { end == end_post; } }").unwrap();
+        let l = crate::lower_program(&p).unwrap();
+        let names: HashMap<String, String> = [("f".to_string(), "T.solution.f".to_string())].into();
+        let tn = TypeNames::new();
+        let ob = obligations(&cx_with(&names, &tn), &l[0]);
+        let ic = ob.iter().find(|o| o.name == "f.impl_correct").unwrap();
+        assert!(ic.statement.contains("⦃ end' =>"), "{}", ic.statement);
+        assert!(ic.statement.contains("f_spec «end» end_post end'"), "{}", ic.statement);
+    }
+
+    #[test]
+    fn an_empty_table_has_lemmas_that_elaborate() {
+        let t = Table { name: "K".into(), ty: RType::Seq(Box::new(RType::Int { signed: false, bits: 8 }), SeqKind::Slice), elems: vec![] };
+        let s = tables_lean("T", &[t]);
+        assert!(s.contains("def K_packed : List Nat := []"), "{s}");
+        assert!(s.contains("(h : i < 0)") && s.contains("exact absurd h (Nat.not_lt_zero i)"), "{s}");
+    }
+
+    #[test]
+    fn ens_kinds_are_exact() {
+        assert!(is_obligation_kind("ens_0") && is_obligation_kind("ens_12") && is_obligation_kind("wf"));
+        assert!(!is_obligation_kind("ens_") && !is_obligation_kind("ens_bound") && !is_obligation_kind("ens_01") && !is_obligation_kind("ens_0_aux"));
+    }
+
+    #[test]
+    fn statements_mirror_obligations_without_proofs() {
+        let p = crate::parse_program("djinn! { #[ensures(r >= x)] pub fn f(x: u32) -> r: u32 { r == x; } }").unwrap();
+        let l = crate::lower_program(&p).unwrap();
+        let names = HashMap::new();
+        let tn = TypeNames::new();
+        let cx = cx_with(&names, &tn);
+        let st = statements_lean(&cx, &l);
+        let ob = obligations_lean(&cx, &l);
+        assert!(!st.contains("import T.Proofs") && ob.contains("import T.Proofs"), "{st}");
+        assert!(st.contains("namespace T.Obligations") && st.contains("axiom f.ens_0 :"), "{st}");
+        for o in obligations(&cx, &l[0]) {
+            assert!(st.contains(&o.statement) && ob.contains(&o.statement));
+        }
+        let audit = audit_lean(&cx, &l);
+        assert!(audit.contains("nm [\"T\", \"Obligations\", \"f\", \"ens_0\"]"), "{audit}");
+        assert!(!audit.contains("import T"), "the audit must not import the package: {audit}");
+    }
 }

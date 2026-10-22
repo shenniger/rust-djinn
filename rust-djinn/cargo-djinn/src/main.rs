@@ -1,7 +1,8 @@
 //! `cargo djinn` — the Djinn-on-Aeneas driver.
 //!
 //! translate            emit the trusted Lean files and the harness guide
-//! verify [--jail DIR]  the whole gate; exit 0 iff PASS
+//! verify [--jail DIR]  the whole gate; exit 0 iff PASS, 3 if only the specification
+//!                      is verified (some `fn` not implemented yet), 1 otherwise
 //! implement [opts]     run Claude Code or Codex in a jail against the verifier
 //! status               declarations implemented/proved, agent jobs, cost
 //! clean                archive solution + proofs in .djinnscratch/backup/, remove the derived files
@@ -14,11 +15,15 @@ use cargo_djinn::{agent, bench, guide, mcp, optimize, smoke, status, verify};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// `verify`'s exit status when only the specification is verified.
+const SPEC_ONLY: u8 = 3;
+
 fn usage() -> ExitCode {
     eprintln!(
         "usage: cargo djinn <command> [--manifest-path Cargo.toml]
   translate
-  verify [--jail DIR]
+  verify [--jail DIR]                          exit status: 0 PASS, 1 FAIL, 3 specification verified
+                                               but some fn not implemented yet (not a PASS)
   implement [--agent codex|claude] [--background] [-B|--reimplement] [--yolo] [--model M] [--effort E]
             [--limit USD] [--max-budget-usd N] [--args \"...\"] [--prompt TEXT | --prompt-file F]
             (reuses existing solution/proofs and only completes what is missing; -B starts over)
@@ -31,7 +36,8 @@ fn usage() -> ExitCode {
                                                (with bench_points: every point, J at a time; default 4)
   optimize (--cycles N | --limit USD) [--min-time S] [--batches K] [--jobs J] [--threshold PCT]
            [--agent codex|claude] [--model M] [--args \"...\"] [--prompt TEXT]
-           (hill-climb on the workload under the verifier; Ctrl-C reverts to the last known-good state)
+           (hill-climb on the workload under the verifier; Ctrl-C reverts to the last known-good state;
+            a restart resumes the history: --cycles and --limit count every run; exit 5 on an agent API error)
   smoke-test [--max-len N] [--int-bound B] [--max-examples K] [--timeout S] [--only NAME]
             (bounded symbolic checks of the spec with Z3; never run by other commands)"
     );
@@ -153,11 +159,20 @@ fn main() -> ExitCode {
         Some("translate") => verify::translate(&cfg, &mut verify::Log::new(true)).map(|_| true),
         Some("clean") if list_backups => agent::list_backups(&cfg).map(|_| true),
         Some("clean") => match restore {
-            Some(id) => agent::restore(&cfg, id.as_deref()),
+            Some(id) => match agent::restore(&cfg, id.as_deref()) {
+                // the restored work verifies, but some `fn` is unimplemented (as for verify)
+                Ok(true) if verify::Report::load(&cfg).is_some_and(|r| !r.unimplemented().is_empty()) => return ExitCode::from(SPEC_ONLY),
+                r => r,
+            },
             None => agent::clean(&cfg).map(|_| true),
         },
         Some("verify") => {
             let report = verify::verify(&cfg, jail.as_deref(), &mut verify::Log::new(true));
+            // every obligation so far proved, but not every `fn` implemented:
+            // not a PASS (the build gate refuses the crate), and not a FAIL
+            if report.pass && !report.unimplemented().is_empty() {
+                return ExitCode::from(SPEC_ONLY);
+            }
             Ok(report.pass)
         }
         Some("implement") => agent::implement(&cfg, opts, &bin),
@@ -179,7 +194,10 @@ fn main() -> ExitCode {
             }
             None => Err("supervise needs --job ID".into()),
         },
-        Some("smoke-test") => smoke::smoke_test(&cfg, &sb),
+        Some("smoke-test") => match smoke::smoke_test(&cfg, &sb) {
+            Ok(code) => return ExitCode::from(code),
+            Err(e) => Err(e),
+        },
         Some("bench") => {
             let mut say = |s: &str| eprintln!("{s}");
             bench::measure(&cfg, min_time, batches, jobs, &mut say).map(|m| {
@@ -190,7 +208,10 @@ fn main() -> ExitCode {
                 true
             })
         }
-        Some("optimize") => optimize::optimize(&cfg, optimize::OptOpts { cycles, min_time, batches, jobs, threshold, agent: opts }, &bin),
+        Some("optimize") => match optimize::optimize(&cfg, optimize::OptOpts { cycles, min_time, batches, jobs, threshold, agent: opts }, &bin) {
+            Ok(code) => return ExitCode::from(code),
+            Err(e) => Err(e),
+        },
         Some("mcp") => match jail {
             Some(j) => {
                 mcp::serve(&cfg, &j);

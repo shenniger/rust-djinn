@@ -319,6 +319,15 @@ The bodies constrain the output. The forms you will use first:
 | `some k: int { … }` | there is a `k` for which the statements hold (an unnamed intermediate) |
 | `match e { Pat(a) => { … } _ => { false; } }` | case analysis on an enum or `Option` |
 | `v.iter().filter(\|y\| y < 0).count()` | the Rust idioms the verifier knows models for |
+| `a & b`  `a \| b`  `a ^ b` | bitwise and, or, xor of non-negative integers |
+| `a << n`  `a >> n` | `a * 2^n` and `a / 2^n` (rounding down): integers are mathematical, so `<<` drops no bits; a 32-bit word is `(a << n) % 2.pow(32)` |
+| `const K: &[u32] = &[…];` then `K[i]`, `K.len()` | an array constant of the file, a table of integers (any size: tables are packed for Lean) |
+| `x.count_ones()`  `x.leading_zeros()`  `x.trailing_zeros()` (and `count_zeros`, `leading_ones`, `trailing_ones`) | Rust's bit counts of a machine integer (or of `e as u32`) |
+| `x.rotate_left(n)`  `x.rotate_right(n)` | Rust's rotations at `x`'s width |
+| `x.wrapping_add(y)`  `x.wrapping_sub(y)`  `x.wrapping_mul(y)` | the result reduced to `x`'s width, as Rust computes it (two's complement for signed `x`) |
+| `x == if c { a } else { b }` | a value chosen by a condition; each branch need only make sense where it is taken |
+| `f(x > 0)`  `b == s.iter().all(\|e\| ok(e))` | a comparison passed as a `bool`; closures may call `rel`s |
+| `u32::MAX`  `i8::MIN`  `u16::BITS`  `usize::MAX` | integer bounds (`usize`'s width is left open: 32 or 64 bits) |
 | `old(v)` | the entry value of a `&mut` parameter |
 | `#[requires(…)]` `#[ensures(…)]` | precondition; a consequence exported to callers and proved from the body |
 | `pub rel name(…) -> r: T { … }` | a relation: used by `fn`s, never implemented, may be ambiguous |
@@ -328,7 +337,10 @@ The bodies constrain the output. The forms you will use first:
 | `#[weakly_specified]` | required on every `fn` that has an `any` or calls one that does: the implementer's choices are reviewed by a human |
 
 Arguments of a `fn` are Rust types; a `rel` may additionally take `int`, the
-mathematical integers, for indices and counts.
+mathematical integers, for indices and counts. Structs with `Vec` fields and
+arrays `[T; N]` work as inputs and outputs (an array's length is part of its
+specification). There is no `Box` and no mutual recursion between `rel`s:
+represent a tree as a flat arena of nodes with indices (`example/shapes`).
 
 # Examples
 Find more examples in [../example](../example).

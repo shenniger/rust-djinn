@@ -70,7 +70,8 @@ pub fn serve(cfg: &Config, jail: &Path) {
                         let mut log = Log::new(false);
                         let report = verify::verify(cfg, Some(jail), &mut log);
                         let tail: Vec<&str> = log.text.lines().rev().take(120).collect::<Vec<_>>().into_iter().rev().collect();
-                        (format!("{}\n--- verifier output (tail) ---\n{}", report.summary(), tail.join("\n")), !report.pass)
+                        // a specification-only PASS (some `fn` not implemented) is no pass
+                        (format!("{}\n--- verifier output (tail) ---\n{}", report.summary(), tail.join("\n")), !report.pass || !report.unimplemented().is_empty())
                     }
                     "status" => (crate::status::status_text(cfg), false),
                     _ => (format!("unknown tool `{name}`"), true),

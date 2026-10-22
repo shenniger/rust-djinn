@@ -1,15 +1,126 @@
 # Written by `cargo djinn` after every verify. Per declaration: its tokens as
 # verified, what it uses, and the status of each obligation. The `djinn!`
 # macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
-# used declaration's) differ from this file. Commit it with solution/ and proofs/.
+# used declaration's) differ from this file, and the whole crate when the
+# solution or proof files differ from `run.evidence` (edit them, verify again).
+# Commit it with solution/ and proofs/.
 
 [run]
-time = "2026-10-13 04:43:14 UTC"
-unix_time = 1791866594
-duration_secs = 289
+time = "2026-10-22 04:51:11 UTC"
+unix_time = 1792644671
+duration_secs = 196
 pass = true
 stage = "done"
 errors = []
+evidence = """
+fnv1a64v2:b00e3e6336d593f8:107
+3de742a144456d6f djinn/proofs/Gzip.lean
+20ba920d27e12f28 djinn/proofs/Gzip/Proofs.lean
+ba0bf4205bd048ef djinn/proofs/Gzip/Proofs/Bits.lean
+a9ceb701d8e32a29 djinn/proofs/Gzip/Proofs/Blocks.lean
+27344ada7d15d0f0 djinn/proofs/Gzip/Proofs/Body.lean
+30442d0c2e930836 djinn/proofs/Gzip/Proofs/Build.lean
+e24be8ab7bdd1164 djinn/proofs/Gzip/Proofs/Cache.lean
+f74468bfc60ce01a djinn/proofs/Gzip/Proofs/Canon.lean
+80bbfa474de98c7c djinn/proofs/Gzip/Proofs/Cells.lean
+52dbcf0777e7af6d djinn/proofs/Gzip/Proofs/Chains.lean
+69fd82cf4b1908f5 djinn/proofs/Gzip/Proofs/Codes.lean
+cd03d858b7cb1595 djinn/proofs/Gzip/Proofs/Copies.lean
+445ac00bcfb0ea30 djinn/proofs/Gzip/Proofs/CostHistogram.lean
+7a5dd6db182e6f73 djinn/proofs/Gzip/Proofs/Costs.lean
+42b4a61b714cd684 djinn/proofs/Gzip/Proofs/Counting.lean
+ac14a9660612ad4c djinn/proofs/Gzip/Proofs/Crc.lean
+973b3d7eea0aec58 djinn/proofs/Gzip/Proofs/CrcImpl.lean
+2553bfcfcb71e4dd djinn/proofs/Gzip/Proofs/CrcWord.lean
+a0d702859804d9db djinn/proofs/Gzip/Proofs/DeBruijn.lean
+fad3e4d5f53bc31a djinn/proofs/Gzip/Proofs/Decode/BaseImpl.lean
+6ddaac0c1e6e9d26 djinn/proofs/Gzip/Proofs/Decode/BaseTables.lean
+c4b97fd4cd2ed165 djinn/proofs/Gzip/Proofs/Decode/BlockFacts.lean
+e83433358501d109 djinn/proofs/Gzip/Proofs/Decode/BlockImpl.lean
+9a22a6231145eee3 djinn/proofs/Gzip/Proofs/Decode/BlocksImpl.lean
+c3a5d179dead52da djinn/proofs/Gzip/Proofs/Decode/ClImpl.lean
+cf7e47be592d27db djinn/proofs/Gzip/Proofs/Decode/CodewordImpl.lean
+e2c30cc8873120b4 djinn/proofs/Gzip/Proofs/Decode/CodewordTable.lean
+4b23e60248f52019 djinn/proofs/Gzip/Proofs/Decode/CopyImpl.lean
+edf14340ba7d6828 djinn/proofs/Gzip/Proofs/Decode/CrcImpl.lean
+37ca2e5b8747cdbc djinn/proofs/Gzip/Proofs/Decode/DecodeTable.lean
+842091961affb1a4 djinn/proofs/Gzip/Proofs/Decode/Decoding.lean
+2bcfc97177901fbf djinn/proofs/Gzip/Proofs/Decode/DecompressImpl.lean
+e008aa6309cf564e djinn/proofs/Gzip/Proofs/Decode/DynamicFacts.lean
+4958637f3559e27f djinn/proofs/Gzip/Proofs/Decode/DynamicImpl.lean
+7f730c17299a6142 djinn/proofs/Gzip/Proofs/Decode/Encoding.lean
+6cfa2ffe62a93d5f djinn/proofs/Gzip/Proofs/Decode/EntryInv.lean
+46966d9904a110dd djinn/proofs/Gzip/Proofs/Decode/FastSymbol.lean
+576ee071567ebdb2 djinn/proofs/Gzip/Proofs/Decode/FourHistogramFacts.lean
+31a816a0d9b7f921 djinn/proofs/Gzip/Proofs/Decode/FourHistogramImpl.lean
+8a490d9526e74254 djinn/proofs/Gzip/Proofs/Decode/FourHistogramMerge.lean
+d6d65506f7876629 djinn/proofs/Gzip/Proofs/Decode/HeaderImpl.lean
+93617be4f50de227 djinn/proofs/Gzip/Proofs/Decode/Huffman.lean
+d18d7b8779349a38 djinn/proofs/Gzip/Proofs/Decode/LengthsFacts.lean
+1afefc9f08aa9e98 djinn/proofs/Gzip/Proofs/Decode/LengthsImpl.lean
+154f8451fcc3b81f djinn/proofs/Gzip/Proofs/Decode/LengthsWindow.lean
+4b770afdd21353cb djinn/proofs/Gzip/Proofs/Decode/LongHints.lean
+16707b1bbc05bdbd djinn/proofs/Gzip/Proofs/Decode/MatchImpl.lean
+39577cca25b0e60e djinn/proofs/Gzip/Proofs/Decode/Parsing.lean
+bc163faeb3a255ba djinn/proofs/Gzip/Proofs/Decode/PeekFacts.lean
+6ed1e3c5af18e6c1 djinn/proofs/Gzip/Proofs/Decode/PeekImpl.lean
+2f246394b5cf2c9d djinn/proofs/Gzip/Proofs/Decode/ReaderImpl.lean
+811deb06103c1634 djinn/proofs/Gzip/Proofs/Decode/RepeatImpl.lean
+6c41da1752e9666a djinn/proofs/Gzip/Proofs/Decode/RevFacts.lean
+7117f0594f8e1adf djinn/proofs/Gzip/Proofs/Decode/RoundTrip.lean
+f649413d1f6f0c44 djinn/proofs/Gzip/Proofs/Decode/RunImpl.lean
+01cdc779503a506c djinn/proofs/Gzip/Proofs/Decode/SliceImpl.lean
+d16f108178edefdf djinn/proofs/Gzip/Proofs/Decode/SpecCounterexample.lean
+c0c9a3f5649551ae djinn/proofs/Gzip/Proofs/Decode/StoredImpl.lean
+993a2c59d1e1a2c1 djinn/proofs/Gzip/Proofs/Decode/SubsliceImpl.lean
+51c9fa9b57108a37 djinn/proofs/Gzip/Proofs/Decode/SymbolImpl.lean
+57b9c568e4e53760 djinn/proofs/Gzip/Proofs/Decode/SymbolsFacts.lean
+2b292d8ab4d61c5a djinn/proofs/Gzip/Proofs/Decode/SymbolsImpl.lean
+9ed5b11fb95980fb djinn/proofs/Gzip/Proofs/Decode/TablesImpl.lean
+2dbf64f3f8fff5f5 djinn/proofs/Gzip/Proofs/Decode/TokenImpl.lean
+c8e16d46fc3711a6 djinn/proofs/Gzip/Proofs/Decode/WideFacts.lean
+eaa684f5fa1aaee4 djinn/proofs/Gzip/Proofs/Decode/WindowFacts.lean
+606a9deda7d9c30e djinn/proofs/Gzip/Proofs/Decode/WindowImpl.lean
+a7e5930a265b721c djinn/proofs/Gzip/Proofs/Dp.lean
+49df750f9fa87b01 djinn/proofs/Gzip/Proofs/Dyn.lean
+88c40720d0893ef0 djinn/proofs/Gzip/Proofs/DynBlock.lean
+ce0c366c5b713ad3 djinn/proofs/Gzip/Proofs/Edges.lean
+553c8354e81cf686 djinn/proofs/Gzip/Proofs/Encoder.lean
+d0938eb24725403d djinn/proofs/Gzip/Proofs/Encoding.lean
+c739e9768d8b5fde djinn/proofs/Gzip/Proofs/FastGreedy.lean
+83c23642b8317b55 djinn/proofs/Gzip/Proofs/Fused.lean
+23e9e05ff006b39a djinn/proofs/Gzip/Proofs/Greedy.lean
+dafdedaee6e39f0e djinn/proofs/Gzip/Proofs/Header.lean
+309483c12675ca8b djinn/proofs/Gzip/Proofs/Hints.lean
+294370c3d94a8b84 djinn/proofs/Gzip/Proofs/Histogram.lean
+1c5b2f5533f185ae djinn/proofs/Gzip/Proofs/Huff.lean
+27800c2487bc4e0e djinn/proofs/Gzip/Proofs/Huffman.lean
+008de9b120f62bdc djinn/proofs/Gzip/Proofs/Indices.lean
+409e0a5aedc52c55 djinn/proofs/Gzip/Proofs/LowBit.lean
+125dba48af2470cc djinn/proofs/Gzip/Proofs/Matches.lean
+b927a212e0ff0ad5 djinn/proofs/Gzip/Proofs/Member.lean
+96b67a1ec786aa33 djinn/proofs/Gzip/Proofs/Merge.lean
+458a4a754705ad8a djinn/proofs/Gzip/Proofs/Passes.lean
+c58f8743e8ba79d2 djinn/proofs/Gzip/Proofs/Plans.lean
+461ba152727393c4 djinn/proofs/Gzip/Proofs/PrefixFlags.lean
+4db7e0b4058397b2 djinn/proofs/Gzip/Proofs/PrefixModel.lean
+f440a0d178975e43 djinn/proofs/Gzip/Proofs/PricingHistogram.lean
+2dc8daefae246b1d djinn/proofs/Gzip/Proofs/Reverse.lean
+04e68302914e208d djinn/proofs/Gzip/Proofs/Rle.lean
+ca7b81a90a292791 djinn/proofs/Gzip/Proofs/Runtime.lean
+785d4805f0d83902 djinn/proofs/Gzip/Proofs/Smooth.lean
+b1a31a3faeccbfb6 djinn/proofs/Gzip/Proofs/Split.lean
+5cb72ae392811f0e djinn/proofs/Gzip/Proofs/Stored.lean
+79fd1482d2400111 djinn/proofs/Gzip/Proofs/Symbolize.lean
+b69a551ac1b46853 djinn/proofs/Gzip/Proofs/Symbols.lean
+a61f8da09bbd9aef djinn/proofs/Gzip/Proofs/Tables.lean
+982c23ea882be600 djinn/proofs/Gzip/Proofs/Tokens.lean
+9e13eb6ca390c226 djinn/proofs/Gzip/Proofs/WordPrefix.lean
+8e26ac17315cb85b djinn/proofs/Gzip/Proofs/Writer.lean
+05ac57a98d9d757c djinn/proofs/lake-manifest.json
+c481339e2eef2ca6 djinn/proofs/lakefile.lean
+8e8349acb539bb60 djinn/proofs/lean-toolchain
+183ed9c217e1a472 djinn/solution/mod.rs"""
 
 [[decl]]
 name = "bit"

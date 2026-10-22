@@ -12,6 +12,9 @@ open Aeneas Std Result
 set_option linter.unusedSimpArgs false
 set_option linter.unusedVariables false
 set_option linter.unusedTactic false
+set_option maxHeartbeats 1000000
+
+open scoped Classical
 
 namespace Sudoku.Spec
 
@@ -63,7 +66,7 @@ def digitof_pre (ch : U8) : Prop :=
 
 def digitof_spec (ch : U8) (d : U8) : Prop :=
   digitof_pre ch ∧
-  (d.val : ℤ) = (if (49 ≤ (ch.val : ℤ) ∧ (ch.val : ℤ) ≤ 57) then ((ch.val : ℤ) - 48) else 0)
+  (d.val : ℤ) = (if (49 ≤ (ch.val : ℤ) ∧ (ch.val : ℤ) ≤ 57) then ((ch.val : ℤ) - 48) else 0 : ℤ)
 
 /-! ## func parsepuzzle -/
 
@@ -82,7 +85,7 @@ def digitchar_pre (d : U8) : Prop :=
 
 def digitchar_spec (d : U8) (ch : U8) : Prop :=
   digitchar_pre d ∧
-  (ch.val : ℤ) = (if (d.val : ℤ) ≤ 9 then (48 + (d.val : ℤ)) else 63)
+  (ch.val : ℤ) = (if (d.val : ℤ) ≤ 9 then (48 + (d.val : ℤ)) else 63 : ℤ)
 
 /-! ## func showgrid -/
 
@@ -93,7 +96,7 @@ def showgrid_spec (c : List U8) (s : List U8) : Prop :=
   showgrid_pre c ∧
   (s.length : ℤ) = ((c.length : ℤ) + 1) ∧
   (∀ i : ℤ, 0 ≤ i → i < (c.length : ℤ) → digitchar_spec c[i.toNat]! s[i.toNat]!) ∧
-  ((s[(c.length : ℤ).toNat]!).val : ℤ) = 10
+  ((s[((c.length : ℤ) : ℤ).toNat]!).val : ℤ) = 10
 
 /-! ## rel nosolutiontext -/
 

@@ -4,14 +4,17 @@
     Each theorem below is PINNED by its type and takes its proof from
     `Sudoku.Proofs` by name. The implementer may prove it any way, with any
     helpers, but cannot weaken it: if the type does not match, this file fails
-    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem
-    here against {propext, Classical.choice, Quot.sound}. -/
+    to elaborate. `Audit.lean` then checks every theorem here, outside the
+    reach of `Proofs`: its statement against `Statements.lean`, its proof in
+    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/
 import Sudoku.Spec
 import Sudoku.Code.Funs
 import Sudoku.Proofs
 
 open Aeneas Std
 open Sudoku.Spec
+
+set_option maxHeartbeats 1000000
 
 namespace Sudoku.Obligations
 
@@ -61,8 +64,8 @@ theorem prefixthen.wf :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem solve.unambiguous :
-    ∀ (g : List U8) (o₁ : Option (List U8)) (o₂ : Option (List U8)),
-      solve_spec g o₁ → solve_spec g o₂ → o₁ = o₂ :=
+    ∀ (g : List U8) («o₁» : Option (List U8)) («o₂» : Option (List U8)),
+      solve_spec g «o₁» → solve_spec g «o₂» → o₁ = o₂ :=
   Sudoku.Proofs.solve.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/
@@ -114,8 +117,8 @@ theorem solve.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem digitof.unambiguous :
-    ∀ (ch : U8) (o₁ : U8) (o₂ : U8),
-      digitof_spec ch o₁ → digitof_spec ch o₂ → o₁ = o₂ :=
+    ∀ (ch : U8) («o₁» : U8) («o₂» : U8),
+      digitof_spec ch «o₁» → digitof_spec ch «o₂» → o₁ = o₂ :=
   Sudoku.Proofs.digitof.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/
@@ -149,8 +152,8 @@ theorem digitof.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem parsepuzzle.unambiguous :
-    ∀ (s : List U8) (o₁ : List U8) (o₂ : List U8),
-      parsepuzzle_spec s o₁ → parsepuzzle_spec s o₂ → o₁ = o₂ :=
+    ∀ (s : List U8) («o₁» : List U8) («o₂» : List U8),
+      parsepuzzle_spec s «o₁» → parsepuzzle_spec s «o₂» → o₁ = o₂ :=
   Sudoku.Proofs.parsepuzzle.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/
@@ -192,8 +195,8 @@ theorem parsepuzzle.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem digitchar.unambiguous :
-    ∀ (d : U8) (o₁ : U8) (o₂ : U8),
-      digitchar_spec d o₁ → digitchar_spec d o₂ → o₁ = o₂ :=
+    ∀ (d : U8) («o₁» : U8) («o₂» : U8),
+      digitchar_spec d «o₁» → digitchar_spec d «o₂» → o₁ = o₂ :=
   Sudoku.Proofs.digitchar.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -221,8 +224,8 @@ theorem digitchar.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem showgrid.unambiguous :
-    ∀ (c : List U8) (o₁ : List U8) (o₂ : List U8),
-      showgrid_spec c o₁ → showgrid_spec c o₂ → o₁ = o₂ :=
+    ∀ (c : List U8) («o₁» : List U8) («o₂» : List U8),
+      showgrid_spec c «o₁» → showgrid_spec c «o₂» → o₁ = o₂ :=
   Sudoku.Proofs.showgrid.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/
@@ -292,8 +295,8 @@ theorem nosolutiontext.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem showanswer.unambiguous :
-    ∀ (a : Option (List U8)) (o₁ : List U8) (o₂ : List U8),
-      showanswer_spec a o₁ → showanswer_spec a o₂ → o₁ = o₂ :=
+    ∀ (a : Option (List U8)) («o₁» : List U8) («o₂» : List U8),
+      showanswer_spec a «o₁» → showanswer_spec a «o₂» → o₁ = o₂ :=
   Sudoku.Proofs.showanswer.unambiguous
 
 /-- GUARANTEE: well-formedness and call sites — every partial operation is in

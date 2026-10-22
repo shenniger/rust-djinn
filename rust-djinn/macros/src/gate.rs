@@ -19,6 +19,11 @@ pub(crate) struct Project {
     /// The specification files (see `djinn_syntax::project::spec_files`).
     pub(crate) specs: Vec<PathBuf>,
     pub(crate) solution: PathBuf,
+    /// The crate directory, the Lean project and the namespace: where the
+    /// proof files the report's fingerprint covers live.
+    dir: PathBuf,
+    proofs: PathBuf,
+    ns: String,
     report: PathBuf,
     report_rel: String,
     in_jail: bool,
@@ -36,7 +41,16 @@ pub(crate) fn project() -> Option<Project> {
         Some(toml::Value::Array(a)) => Some(a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()),
         _ => None,
     };
+    let proofs = match get("proofs") {
+        Some(p) => dir.join(p),
+        None => dir.join(&work).join("proofs"),
+    };
+    let name = toml.get("package").and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or_default();
+    let ns = djinn_syntax::project::namespace(get("namespace").as_deref(), name);
     Some(Project {
+        proofs,
+        ns,
+        dir: dir.clone(),
         specs: djinn_syntax::project::spec_files(&dir, manual.as_deref()).into_iter().map(|f| f.path).collect(),
         solution: dir.join(&work).join("solution"),
         report: dir.join(&work).join("report.toml"),
@@ -64,6 +78,8 @@ fn read_report(p: &Project) -> Option<(HashMap<String, Entry>, HashMap<String, (
     let v: toml::Value = toml::from_str(&text).ok()?;
     let mut entries = HashMap::new();
     let mut verdicts = HashMap::new();
+    let evidence = v.get("run").and_then(|r| r.get("evidence")).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    verdicts.insert(EVIDENCE.to_string(), (true, vec![evidence]));
     for d in v.get("decl").and_then(|d| d.as_array()).into_iter().flatten() {
         let name = d.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let kind = d.get("kind").and_then(|x| x.as_str()).unwrap_or("func").to_string();
@@ -91,6 +107,9 @@ fn read_report(p: &Project) -> Option<(HashMap<String, Entry>, HashMap<String, (
     Some((entries, verdicts))
 }
 
+/// The verdicts map's entry for the report's fingerprint (no declaration has this name).
+const EVIDENCE: &str = " evidence";
+
 /// Tokens to prepend to a block's expansion: dependency trackers, and one
 /// `compile_error!` per `fn` that may not be compiled.
 pub fn check(decls: &[Decl], project: Option<&Project>) -> proc_macro2::TokenStream {
@@ -111,10 +130,33 @@ pub fn check(decls: &[Decl], project: Option<&Project>) -> proc_macro2::TokenStr
     out.extend(quote! {
         const _: (Option<&str>, Option<&str>, Option<&str>) = (option_env!("DJINN_GATE"), option_env!("DJINN_VERIFYING"), option_env!("CLIPPY_ARGS"));
     });
+    // and when a solution or proof file changes — every file the fingerprint
+    // covers, not only the modules rustc reads (a stray or backup file counts
+    // too). A file added without any tracked file changing is seen at the
+    // next rebuild; `cargo djinn status` and the editor see it at once.
+    let evidence = djinn_syntax::project::evidence(&p.dir, &p.solution, &p.proofs, &p.ns);
+    for f in evidence.iter().flat_map(|e| e.files.iter()) {
+        let path = f.to_string_lossy().into_owned();
+        out.extend(quote! { const _: &[u8] = include_bytes!(#path); });
+    }
     if gate_off(p) {
         return out;
     }
     let report = read_report(p);
+    // the solution and proof files must be the ones the report's verify checked
+    let changed: Option<String> = report.as_ref().and_then(|(_, v)| {
+        let recorded = v.get(EVIDENCE).and_then(|(_, e)| e.first()).map(|e| e.as_str()).unwrap_or("");
+        match djinn_syntax::project::check_evidence(recorded, &evidence) {
+            djinn_syntax::project::EvidenceCheck::Same => None,
+            djinn_syntax::project::EvidenceCheck::Unrecorded => Some(format!("no evidence fingerprint recorded in {}: run `cargo djinn verify`", p.report_rel)),
+            djinn_syntax::project::EvidenceCheck::Outdated => Some(format!("the evidence fingerprint in {} is of an older `cargo djinn`: run `cargo djinn verify`", p.report_rel)),
+            djinn_syntax::project::EvidenceCheck::Changed(d) => {
+                let which = if d.is_empty() { String::new() } else { format!(": {}", d.iter().take(8).cloned().collect::<Vec<_>>().join(", ") + if d.len() > 8 { ", …" } else { "" }) };
+                Some(format!("the solution or proof files changed since the last `cargo djinn verify` ({} records what was verified){which}; run `cargo djinn verify` (an editor backup or other stray file counts: delete it)", p.report_rel))
+            }
+            djinn_syntax::project::EvidenceCheck::Invalid(e) => Some(format!("the solution or proof files cannot be fingerprinted: {e}")),
+        }
+    });
     // the current declarations: the whole specification when it parses
     // (a used declaration may live in another block), else this block
     let current: HashMap<String, Entry> = {
@@ -153,6 +195,8 @@ pub fn check(decls: &[Decl], project: Option<&Project>) -> proc_macro2::TokenStr
                         } else {
                             format!("djinn {word} `{name}` uses `{which}`, which changed since `{name}` was verified; run `cargo djinn implement`")
                         }
+                    } else if let (true, Some(why)) = (*ok, &changed) {
+                        format!("djinn {word} `{name}`: {why}")
                     } else if *ok {
                         continue;
                     } else {

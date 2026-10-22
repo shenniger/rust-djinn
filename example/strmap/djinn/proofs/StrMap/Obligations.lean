@@ -4,14 +4,17 @@
     Each theorem below is PINNED by its type and takes its proof from
     `StrMap.Proofs` by name. The implementer may prove it any way, with any
     helpers, but cannot weaken it: if the type does not match, this file fails
-    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem
-    here against {propext, Classical.choice, Quot.sound}. -/
+    to elaborate. `Audit.lean` then checks every theorem here, outside the
+    reach of `Proofs`: its statement against `Statements.lean`, its proof in
+    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/
 import StrMap.Spec
 import StrMap.Code.Funs
 import StrMap.Proofs
 
 open Aeneas Std
 open StrMap.Spec
+
+set_option maxHeartbeats 1000000
 
 namespace StrMap.Obligations
 
@@ -21,8 +24,8 @@ namespace StrMap.Obligations
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem byte_len.unambiguous :
-    ∀ (s : List U8) (o₁ : Usize) (o₂ : Usize),
-      byte_len_spec s o₁ → byte_len_spec s o₂ → o₁ = o₂ :=
+    ∀ (s : List U8) («o₁» : Usize) («o₂» : Usize),
+      byte_len_spec s «o₁» → byte_len_spec s «o₂» → o₁ = o₂ :=
   StrMap.Proofs.byte_len.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -38,11 +41,11 @@ theorem byte_len.impl_correct :
 theorem byte_len.exists :
     ∀ (s : String), byte_len_pre (Djinn.Vocab.bytes s) → ∃ r, byte_len_spec (Djinn.Vocab.bytes s) r :=
   by
-  intro s h
-  have hs := byte_len.impl_correct s h
-  rw [Aeneas.Std.WP.spec_equiv_exists] at hs
-  obtain ⟨_, _, h2⟩ := hs
-  exact ⟨_, h2⟩
+  intro s h_pre_
+  have h_impl_ := byte_len.impl_correct s h_pre_
+  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_
+  obtain ⟨_, _, h_post_⟩ := h_impl_
+  exact ⟨_, h_post_⟩
 
 /-! ### has_key  (func) -/
 
@@ -50,8 +53,8 @@ theorem byte_len.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem has_key.unambiguous :
-    ∀ (m : List (U32 × U64)) (k : U32) (o₁ : Bool) (o₂ : Bool),
-      has_key_spec m k o₁ → has_key_spec m k o₂ → o₁ = o₂ :=
+    ∀ (m : List (U32 × U64)) (k : U32) («o₁» : Bool) («o₂» : Bool),
+      has_key_spec m k «o₁» → has_key_spec m k «o₂» → o₁ = o₂ :=
   StrMap.Proofs.has_key.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -67,11 +70,11 @@ theorem has_key.impl_correct :
 theorem has_key.exists :
     ∀ (m : std.collections.hash.map.HashMap U32 U64 std.hash.random.RandomState Global) (k : U32), has_key_pre m.entries k → ∃ r, has_key_spec m.entries k r :=
   by
-  intro m k h
-  have hs := has_key.impl_correct m k h
-  rw [Aeneas.Std.WP.spec_equiv_exists] at hs
-  obtain ⟨_, _, h2⟩ := hs
-  exact ⟨_, h2⟩
+  intro m k h_pre_
+  have h_impl_ := has_key.impl_correct m k h_pre_
+  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_
+  obtain ⟨_, _, h_post_⟩ := h_impl_
+  exact ⟨_, h_post_⟩
 
 /-! ### lookup  (func) -/
 
@@ -79,8 +82,8 @@ theorem has_key.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem lookup.unambiguous :
-    ∀ (m : List (U32 × U64)) (k : U32) (o₁ : Option U64) (o₂ : Option U64),
-      lookup_spec m k o₁ → lookup_spec m k o₂ → o₁ = o₂ :=
+    ∀ (m : List (U32 × U64)) (k : U32) («o₁» : Option U64) («o₂» : Option U64),
+      lookup_spec m k «o₁» → lookup_spec m k «o₂» → o₁ = o₂ :=
   StrMap.Proofs.lookup.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -96,11 +99,11 @@ theorem lookup.impl_correct :
 theorem lookup.exists :
     ∀ (m : std.collections.hash.map.HashMap U32 U64 std.hash.random.RandomState Global) (k : U32), lookup_pre m.entries k → ∃ r, lookup_spec m.entries k r :=
   by
-  intro m k h
-  have hs := lookup.impl_correct m k h
-  rw [Aeneas.Std.WP.spec_equiv_exists] at hs
-  obtain ⟨_, _, h2⟩ := hs
-  exact ⟨_, h2⟩
+  intro m k h_pre_
+  have h_impl_ := lookup.impl_correct m k h_pre_
+  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_
+  obtain ⟨_, _, h_post_⟩ := h_impl_
+  exact ⟨_, h_post_⟩
 
 /-! ### lookup_next  (func) -/
 
@@ -108,8 +111,8 @@ theorem lookup.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem lookup_next.unambiguous :
-    ∀ (m : List (U32 × U64)) (k : U32) (o₁ : Option U64) (o₂ : Option U64),
-      lookup_next_spec m k o₁ → lookup_next_spec m k o₂ → o₁ = o₂ :=
+    ∀ (m : List (U32 × U64)) (k : U32) («o₁» : Option U64) («o₂» : Option U64),
+      lookup_next_spec m k «o₁» → lookup_next_spec m k «o₂» → o₁ = o₂ :=
   StrMap.Proofs.lookup_next.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -125,10 +128,10 @@ theorem lookup_next.impl_correct :
 theorem lookup_next.exists :
     ∀ (m : std.collections.hash.map.HashMap U32 U64 std.hash.random.RandomState Global) (k : U32), lookup_next_pre m.entries k → ∃ r, lookup_next_spec m.entries k r :=
   by
-  intro m k h
-  have hs := lookup_next.impl_correct m k h
-  rw [Aeneas.Std.WP.spec_equiv_exists] at hs
-  obtain ⟨_, _, h2⟩ := hs
-  exact ⟨_, h2⟩
+  intro m k h_pre_
+  have h_impl_ := lookup_next.impl_correct m k h_pre_
+  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_
+  obtain ⟨_, _, h_post_⟩ := h_impl_
+  exact ⟨_, h_post_⟩
 
 end StrMap.Obligations

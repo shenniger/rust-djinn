@@ -15,7 +15,7 @@ theorem length_table (k : Nat) (hk : k ≤ 28) :
     have hkbound : k ≤ 26 := by omega
     have hprev := ih (by omega)
     rw [lbase_spec]
-    refine ⟨by simp only [lbase_pre, dbase_pre]; omega, fun _ => ⟨by omega, ?_, ?_⟩⟩
+    refine ⟨by simp only [lbase_pre, dbase_pre]; omega, fun _ => ⟨by omega, fun _ => ⟨?_, ?_⟩⟩⟩
     · intro h; omega
     · intro _
       refine ⟨by intro h; omega, fun _ => ?_⟩
@@ -32,7 +32,7 @@ theorem distance_table (k : Nat) (hk : k ≤ 29) :
     have hkbound : k ≤ 28 := by omega
     have hprev := ih (by omega)
     rw [dbase_spec]
-    refine ⟨by simp only [lbase_pre, dbase_pre]; omega, fun _ => ⟨by omega, ?_, ?_⟩⟩
+    refine ⟨by simp only [lbase_pre, dbase_pre]; omega, fun _ => ⟨by omega, fun _ => ⟨?_, ?_⟩⟩⟩
     · intro h; omega
     · intro _
       refine ⟨distanceBases[k]!, ?_, (if k < 4 then 0 else k / 2 - 1 : Nat), ?_, ?_⟩

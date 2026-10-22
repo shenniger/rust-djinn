@@ -4,14 +4,17 @@
     Each theorem below is PINNED by its type and takes its proof from
     `Lz77.Proofs` by name. The implementer may prove it any way, with any
     helpers, but cannot weaken it: if the type does not match, this file fails
-    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem
-    here against {propext, Classical.choice, Quot.sound}. -/
+    to elaborate. `Audit.lean` then checks every theorem here, outside the
+    reach of `Proofs`: its statement against `Statements.lean`, its proof in
+    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/
 import Lz77.Spec
 import Lz77.Code.Funs
 import Lz77.Proofs
 
 open Aeneas Std
 open Lz77.Spec
+
+set_option maxHeartbeats 1000000
 
 namespace Lz77.Obligations
 
@@ -23,7 +26,7 @@ theorem copies.wf :
     ∀ (l : ℤ) (s : List U8) (j : ℤ) (d : ℤ) (b : Bool),
       copies_spec l s j d b →
       (¬(l = 0) → (0 ≤ j ∧ j < (s.length : ℤ)) ∧ (0 ≤ (j - d) ∧ (j - d) < (s.length : ℤ))) ∧
-      (¬(l = 0) → s[j.toNat]! = s[(j - d).toNat]! → (copies_pre (l - 1) s (j + 1) d)) :=
+      (¬(l = 0) → s[j.toNat]! = s[((j - d) : ℤ).toNat]! → (copies_pre (l - 1) s (j + 1) d)) :=
   Lz77.Proofs.copies.wf
 
 /-! ### ismatch  (rel) -/
@@ -42,8 +45,8 @@ theorem ismatch.wf :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem toklen.unambiguous :
-    ∀ (t : Lz77.spec.Token) (o₁ : U32) (o₂ : U32),
-      toklen_spec t o₁ → toklen_spec t o₂ → o₁ = o₂ :=
+    ∀ (t : Lz77.spec.Token) («o₁» : U32) («o₂» : U32),
+      toklen_spec t «o₁» → toklen_spec t «o₂» → o₁ = o₂ :=
   Lz77.Proofs.toklen.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -73,7 +76,7 @@ theorem encoded.wf :
     ∀ (ts : List Lz77.spec.Token) (m : ℤ),
       encoded_spec ts m →
       (¬((ts.length : ℤ) = 0) → (0 ≤ 0 ∧ 0 ≤ ((ts.length : ℤ) - 1) ∧ ((ts.length : ℤ) - 1) ≤ (ts.length : ℤ))) ∧
-      (¬((ts.length : ℤ) = 0) → ∀ v_call0 : ℤ, encoded_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) v_call0 → (0 ≤ ((ts.length : ℤ) - 1) ∧ ((ts.length : ℤ) - 1) < (ts.length : ℤ))) :=
+      (¬((ts.length : ℤ) = 0) → ∀ v_call0 : ℤ, encoded_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) v_call0 → (0 ≤ ((ts.length : ℤ) - 1) ∧ ((ts.length : ℤ) - 1) < (ts.length : ℤ))) :=
   Lz77.Proofs.encoded.wf
 
 /-! ### decode  (rel) -/
@@ -83,12 +86,12 @@ theorem encoded.wf :
 theorem decode.wf :
     ∀ (ts : List Lz77.spec.Token) (s : List U8),
       decode_spec ts s →
-      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) p ∧ (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ s[(p.length : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[(k - (dist_0.val : ℤ)).toNat]!)))) → (0 ≤ 0 ∧ 0 ≤ ((ts.length : ℤ) - 1) ∧ ((ts.length : ℤ) - 1) ≤ (ts.length : ℤ))) ∧
-      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) p ∧ (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ s[(p.length : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[(k - (dist_0.val : ℤ)).toNat]!)))) → (0 ≤ ((ts.length : ℤ) - 1) ∧ ((ts.length : ℤ) - 1) < (ts.length : ℤ))) ∧
-      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) p ∧ (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ s[(p.length : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[(k - (dist_0.val : ℤ)).toNat]!)))) → (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => (0 ≤ 0 ∧ 0 ≤ (p.length : ℤ) ∧ (p.length : ℤ) ≤ (s.length : ℤ)) | _ => True)) ∧
-      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) p ∧ (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ s[(p.length : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[(k - (dist_0.val : ℤ)).toNat]!)))) → (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => (0 ≤ (p.length : ℤ) ∧ (p.length : ℤ) < (s.length : ℤ)) | _ => True)) ∧
-      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) p ∧ (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ s[(p.length : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[(k - (dist_0.val : ℤ)).toNat]!)))) → (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => True | .Match dist_0 len_1 => (0 ≤ 0 ∧ 0 ≤ (p.length : ℤ) ∧ (p.length : ℤ) ≤ (s.length : ℤ)))) ∧
-      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1)).toNat) p ∧ (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ s[(p.length : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ)).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[(k - (dist_0.val : ℤ)).toNat]!)))) → (match ts[((ts.length : ℤ) - 1).toNat]! with | .Lit ch_0 => True | .Match dist_0 len_1 => ∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → (0 ≤ k ∧ k < (s.length : ℤ)) ∧ (0 ≤ (k - (dist_0.val : ℤ)) ∧ (k - (dist_0.val : ℤ)) < (s.length : ℤ)))) :=
+      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) p ∧ (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ s[((p.length : ℤ) : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[((k - (dist_0.val : ℤ)) : ℤ).toNat]!)))) → (0 ≤ 0 ∧ 0 ≤ ((ts.length : ℤ) - 1) ∧ ((ts.length : ℤ) - 1) ≤ (ts.length : ℤ))) ∧
+      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) p ∧ (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ s[((p.length : ℤ) : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[((k - (dist_0.val : ℤ)) : ℤ).toNat]!)))) → (0 ≤ ((ts.length : ℤ) - 1) ∧ ((ts.length : ℤ) - 1) < (ts.length : ℤ))) ∧
+      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) p ∧ (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ s[((p.length : ℤ) : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[((k - (dist_0.val : ℤ)) : ℤ).toNat]!)))) → (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => (0 ≤ 0 ∧ 0 ≤ (p.length : ℤ) ∧ (p.length : ℤ) ≤ (s.length : ℤ)) | _ => True)) ∧
+      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) p ∧ (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ s[((p.length : ℤ) : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[((k - (dist_0.val : ℤ)) : ℤ).toNat]!)))) → (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => (0 ≤ (p.length : ℤ) ∧ (p.length : ℤ) < (s.length : ℤ)) | _ => True)) ∧
+      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) p ∧ (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ s[((p.length : ℤ) : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[((k - (dist_0.val : ℤ)) : ℤ).toNat]!)))) → (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => True | .Match dist_0 len_1 => (0 ≤ 0 ∧ 0 ≤ (p.length : ℤ) ∧ (p.length : ℤ) ≤ (s.length : ℤ)))) ∧
+      (¬((ts.length : ℤ) = 0) → ∀ p : List U8, (decode_spec ((ts.drop 0).take (((ts.length : ℤ) - 1) : ℤ).toNat) p ∧ (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => ((s.length : ℤ) = ((p.length : ℤ) + 1) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ s[((p.length : ℤ) : ℤ).toNat]! = ch_0) | .Match dist_0 len_1 => ((1 ≤ (dist_0.val : ℤ) ∧ (dist_0.val : ℤ) ≤ (p.length : ℤ)) ∧ 1 ≤ (len_1.val : ℤ) ∧ (s.length : ℤ) = ((p.length : ℤ) + (len_1.val : ℤ)) ∧ ((s.drop 0).take ((p.length : ℤ) : ℤ).toNat) = p ∧ (∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → s[k.toNat]! = s[((k - (dist_0.val : ℤ)) : ℤ).toNat]!)))) → (match ts[(((ts.length : ℤ) - 1) : ℤ).toNat]! with | .Lit ch_0 => True | .Match dist_0 len_1 => ∀ k : ℤ, (p.length : ℤ) ≤ k → k < (s.length : ℤ) → (0 ≤ k ∧ k < (s.length : ℤ)) ∧ (0 ≤ (k - (dist_0.val : ℤ)) ∧ (k - (dist_0.val : ℤ)) < (s.length : ℤ)))) :=
   Lz77.Proofs.decode.wf
 
 /-! ### mincost  (rel) -/
@@ -156,8 +159,8 @@ theorem besttoken.wf :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem compress.unambiguous :
-    ∀ (s : List U8) (o₁ : List Lz77.spec.Token) (o₂ : List Lz77.spec.Token),
-      compress_spec s o₁ → compress_spec s o₂ → o₁ = o₂ :=
+    ∀ (s : List U8) («o₁» : List Lz77.spec.Token) («o₂» : List Lz77.spec.Token),
+      compress_spec s «o₁» → compress_spec s «o₂» → o₁ = o₂ :=
   Lz77.Proofs.compress.unambiguous
 
 /-- GUARANTEE: `ensures` clause 0 follows from the relation itself. -/
@@ -178,7 +181,7 @@ theorem compress.wf :
     ∀ (s : List U8) (ts : List Lz77.spec.Token),
       compress_spec s ts →
       (∀ i : ℤ, 0 ≤ i → i < (ts.length : ℤ) → (0 ≤ 0 ∧ 0 ≤ i ∧ i ≤ (ts.length : ℤ))) ∧
-      (∀ i : ℤ, 0 ≤ i → i < (ts.length : ℤ) → ∀ v_call0 : ℤ, encoded_spec ((ts.drop 0).take (i).toNat) v_call0 → (0 ≤ i ∧ i < (ts.length : ℤ)) ∧ (besttoken_pre ((s.length : ℤ) - v_call0) s)) ∧
+      (∀ i : ℤ, 0 ≤ i → i < (ts.length : ℤ) → ∀ v_call0 : ℤ, encoded_spec ((ts.drop 0).take i.toNat) v_call0 → (0 ≤ i ∧ i < (ts.length : ℤ)) ∧ (besttoken_pre ((s.length : ℤ) - v_call0) s)) ∧
       ((mincost_pre (s.length : ℤ) s)) :=
   Lz77.Proofs.compress.wf
 

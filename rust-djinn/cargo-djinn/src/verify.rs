@@ -76,6 +76,11 @@ struct RunEntry {
     stage: String,
     #[serde(default)]
     errors: Vec<String>,
+    /// The fingerprint of the solution and proof files verified (see
+    /// `djinn_syntax::project::evidence`): the build gate refuses the crate
+    /// when the files on disk no longer match it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    evidence: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,6 +109,8 @@ pub struct Report {
     pub declarations: Vec<DeclStatus>,
     pub errors: Vec<String>,
     pub log_tail: Vec<String>,
+    /// The fingerprint of the solution and proof files this verify checked.
+    pub evidence: String,
 }
 
 impl Report {
@@ -130,7 +137,7 @@ impl Report {
             declarations.push(DeclStatus { name: d.name, kind: d.kind, implemented: d.implemented, obligations: names, tokens: d.tokens, uses: d.uses, ok: d.ok, weak: d.weakly_specified });
         }
         let log_tail = fs::read_to_string(Report::log_path(cfg)).map(|t| t.lines().map(|s| s.to_string()).collect()).unwrap_or_default();
-        Some(Report { time: f.run.unix_time, duration_secs: f.run.duration_secs, pass: f.run.pass, stage: f.run.stage, obligations, declarations, errors: f.run.errors, log_tail })
+        Some(Report { time: f.run.unix_time, duration_secs: f.run.duration_secs, pass: f.run.pass, stage: f.run.stage, obligations, declarations, errors: f.run.errors, log_tail, evidence: f.run.evidence })
     }
     /// Decide `ok` per declaration: implemented (funcs), and every obligation
     /// of it and of the declarations it uses, transitively, proved.
@@ -169,19 +176,28 @@ impl Report {
             })
             .collect();
         let f = ReportFile {
-            run: RunEntry { time: format!("{} UTC", fmt_time(self.time)), unix_time: self.time, duration_secs: self.duration_secs, pass: self.pass, stage: self.stage.clone(), errors: self.errors.clone() },
+            run: RunEntry { time: format!("{} UTC", fmt_time(self.time)), unix_time: self.time, duration_secs: self.duration_secs, pass: self.pass, stage: self.stage.clone(), errors: self.errors.clone(), evidence: self.evidence.clone() },
             decl,
         };
         if let Ok(s) = toml::to_string_pretty(&f) {
-            let header = "# Written by `cargo djinn` after every verify. Per declaration: its tokens as\n# verified, what it uses, and the status of each obligation. The `djinn!`\n# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a\n# used declaration's) differ from this file. Commit it with solution/ and proofs/.\n\n";
+            let header = "# Written by `cargo djinn` after every verify. Per declaration: its tokens as\n# verified, what it uses, and the status of each obligation. The `djinn!`\n# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a\n# used declaration's) differ from this file, and the whole crate when the\n# solution or proof files differ from `run.evidence` (edit them, verify again).\n# Commit it with solution/ and proofs/.\n\n";
             let _ = fs::write(Report::path(cfg), format!("{header}{s}"));
         }
         let _ = fs::write(Report::log_path(cfg), self.log_tail.join("\n"));
     }
+    /// The `fn`s of the specification without an implementation.
+    pub fn unimplemented(&self) -> Vec<String> {
+        self.declarations.iter().filter(|d| d.kind == "func" && !d.implemented).map(|d| d.name.clone()).collect()
+    }
     /// One-paragraph summary for humans and agents.
     pub fn summary(&self) -> String {
         let mut s = String::new();
-        if self.pass {
+        let missing = self.unimplemented();
+        if self.pass && !missing.is_empty() {
+            // the specification's obligations hold, but the crate does not build:
+            // a `fn` without an implementation has no `impl_correct` yet
+            s.push_str(&format!("PASS (specification only): every obligation so far is proved, but {} fn(s) are not implemented: {}. `cargo djinn implement` continues from here.\n", missing.len(), missing.join(", ")));
+        } else if self.pass {
             s.push_str("PASS: every obligation is proved and the axiom audit is clean.\n");
         } else {
             s.push_str(&format!("FAIL at stage: {}\n", self.stage));
@@ -280,6 +296,44 @@ pub fn type_names(cfg: &Config, prog: &Program) -> TypeNames {
     m
 }
 
+/// The tables of the specification files, sorted by name.
+pub fn spec_tables(prog: &Program) -> Vec<emit::Table> {
+    table_names(prog)
+        .into_iter()
+        .map(|n| {
+            let c = &prog.types.consts[&n];
+            emit::Table { name: n.clone(), ty: c.ty.clone(), elems: c.table.clone().unwrap_or_default() }
+        })
+        .collect()
+}
+
+/// The models of the tables' Rust constants, which Charon keeps opaque:
+/// Aeneas's name pattern (`crate::module::NAME` with the crate's name) and the
+/// Lean definition.
+fn table_models(cfg: &Config, prog: &Program) -> Vec<(String, String)> {
+    let specs = cfg.specs();
+    let krate = cfg.crate_name.replace('-', "_");
+    spec_tables(prog)
+        .iter()
+        .map(|t| {
+            let module = module_of(&specs, prog, &t.name);
+            let pattern = format!("{}::{}", cfg.rust_module(&krate, module.as_deref()), t.name);
+            let lean = match &module {
+                Some(m) => format!("{}.{}", m.replace("::", "."), t.name),
+                None => t.name.clone(),
+            };
+            (pattern, emit::table_model(&cfg.ns, &lean, t))
+        })
+        .collect()
+}
+
+/// The array constants of the specification files (tables), sorted.
+pub fn table_names(prog: &Program) -> Vec<String> {
+    let mut v: Vec<String> = prog.types.consts.iter().filter(|(_, c)| c.table.is_some()).map(|(n, _)| n.clone()).collect();
+    v.sort();
+    v
+}
+
 /// The ambient functions the specification's constraints call.
 pub fn ambient_used(prog: &Program) -> Vec<String> {
     let mut v: Vec<String> = prog.types.ambient.keys().filter(|f| prog.decls.iter().any(|d| d.requires.iter().chain(d.ensures.iter()).chain(d.decreases.iter()).any(|e| e.calls(f)) || d.body.iter().any(|s| s.calls(f)))).cloned().collect();
@@ -375,15 +429,47 @@ pub fn emit_cx<'a>(cfg: &'a Config, lowered: &[Lowered], impl_names: &'a HashMap
     }
 }
 
-/// Does `Code/Types.lean` define every user type the specification mentions?
+/// Was `Code/` translated from the specification's current types and ambient
+/// functions? `aeneas_pipeline` records what it translated (`types_record`)
+/// in the scratch space; anything else — another field, variant, module or
+/// ambient body, or no record — needs Charon and Aeneas again.
 pub fn types_available(cfg: &Config, prog: &Program) -> bool {
-    let Ok(text) = fs::read_to_string(cfg.lean_dir().join("Code").join("Types.lean")) else { return false };
-    let defined = |n: &str| text.contains(&format!(".{n} where")) || text.contains(&format!(" {n} where")) || text.contains(&format!("inductive {n}")) || text.contains(&format!("structure {n}"));
-    let user_ok = prog.types.enums.keys().chain(prog.types.structs.keys()).all(|n| defined(n));
+    if !cfg.lean_dir().join("Code").join("Types.lean").exists() {
+        return false;
+    }
+    let user_ok = types_recorded(cfg, prog);
     // a `HashMap` in a signature needs the modeled type from `TypesExternal.lean`
     let uses_map = prog.decls.iter().any(|d| d.params.iter().any(|p| has_map(&p.ty)) || d.ret.as_ref().map(|(_, t)| has_map(t)).unwrap_or(false));
     let map_ok = !uses_map || fs::read_to_string(cfg.lean_dir().join("Code").join("TypesExternal.lean")).map(|t| t.contains("structure std.collections.hash.map.HashMap")).unwrap_or(false);
     user_ok && map_ok
+}
+
+/// Is `Code/` recorded as the translation of the current types and ambient functions?
+fn types_recorded(cfg: &Config, prog: &Program) -> bool {
+    fs::read_to_string(types_record_path(cfg)).ok().as_deref() == Some(types_record(cfg, prog).as_str())
+}
+
+fn types_record_path(cfg: &Config) -> std::path::PathBuf {
+    cfg.state_dir().join("types.translated")
+}
+
+/// The specification's user types and ambient functions, canonically: each
+/// with its module, its definition (fields, variants and their types in
+/// order) or source, sorted by name.
+fn types_record(cfg: &Config, prog: &Program) -> String {
+    let specs = cfg.specs();
+    let mut lines: Vec<String> = Vec::new();
+    for (n, e) in &prog.types.enums {
+        lines.push(format!("enum {n} in {:?}: {:?}", module_of(&specs, prog, n), e.variants));
+    }
+    for (n, s) in &prog.types.structs {
+        lines.push(format!("struct {n} in {:?}: {:?}", module_of(&specs, prog, n), s.fields));
+    }
+    for (n, a) in &prog.types.ambient {
+        lines.push(format!("fn {n} in {:?}: {}", module_of(&specs, prog, n), a.source));
+    }
+    lines.sort();
+    lines.join("\n")
 }
 
 fn has_map(t: &djinn_syntax::RType) -> bool {
@@ -435,16 +521,112 @@ pub fn decl_statuses(cfg: &Config, lowered: &[Lowered], names: &HashMap<String, 
 
 
 /// Does a Lean segment (a top-level command with its attributes and doc
-/// comment) mention one of the removed declarations: its `_spec`/`_pre`,
-/// its obligations `name.…`, helpers named `name_…`, or its Aeneas model
-/// `….name`?
-fn mentions(segment: &str, removed: &[String]) -> Option<String> {
-    for word in segment.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '\'')) {
-        for n in removed {
-            let w = word.trim_matches('.');
-            if w == format!("{n}_spec") || w == format!("{n}_pre") || w.starts_with(&format!("{n}.")) || w.starts_with(&format!("{n}_")) || w.ends_with(&format!(".{n}")) || w.contains(&format!(".{n}.")) {
+/// comment) concern one of the removed declarations: is it named after it
+/// (`name`, `name.…`, `name_…`), or does it mention its definitions
+/// (`name_spec`, `name_pre`, `name_body` and their lemmas `name_spec.…`), one of
+/// its obligations (`name.unambiguous`, …, exactly), or its Aeneas model
+/// (`<module>.name`, `<module>.name_loop…`, for a module of the solution's
+/// translation in `modules`, with or without the namespace `ns`)? Other words
+/// that merely start with the name (`min_le_left` for a removed `min`) do not
+/// count.
+fn mentions(segment: &str, removed: &[String], ns: &str, modules: &[String]) -> Option<String> {
+    let declared = declared_name(segment);
+    let strip = |w: &str| -> String {
+        let w = w.strip_prefix(&format!("{ns}.")).unwrap_or(w);
+        ["Spec.", "Proofs.", "Obligations."].iter().find_map(|p| w.strip_prefix(p)).unwrap_or(w).to_string()
+    };
+    for n in removed {
+        if let Some(d) = &declared {
+            let d = strip(d);
+            if d == *n || d.starts_with(&format!("{n}.")) || d.starts_with(&format!("{n}_")) {
                 return Some(n.clone());
             }
+        }
+    }
+    for word in segment.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '\'' || c == '«' || c == '»')) {
+        let w = strip(word.trim_matches('.'));
+        for n in removed {
+            let own = ["_spec", "_pre", "_body"].iter().any(|s| w == format!("{n}{s}") || w.starts_with(&format!("{n}{s}.")));
+            let obligation = w.strip_prefix(&format!("{n}.")).is_some_and(emit::is_obligation_kind);
+            let model = model_of(&w, n, modules).is_some();
+            if own || obligation || model {
+                return Some(n.clone());
+            }
+        }
+    }
+    None
+}
+
+/// The name a segment's command declares (`theorem x`, `private lemma x`, …).
+fn declared_name(segment: &str) -> Option<String> {
+    const KW: &[&str] = &["theorem", "lemma", "def", "abbrev", "instance", "structure", "inductive", "opaque", "axiom"];
+    const MODS: &[&str] = &["private", "protected", "noncomputable", "partial", "nonrec", "unsafe"];
+    for l in segment.lines() {
+        let mut ws = l.split_whitespace().skip_while(|w| MODS.contains(w));
+        if let Some(k) = ws.next() {
+            if KW.contains(&k) {
+                return ws.next().map(|n| n.trim_end_matches(':').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The Lean module paths (without the namespace) of the solution's Aeneas
+/// translation: `solution`, `spec`, `solution.sub`, … — what models of
+/// functions are named under.
+fn model_modules(cfg: &Config) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for lean in model_names(cfg) {
+        if let Some((m, _)) = lean.rsplit_once('.') {
+            if !v.iter().any(|x| x == m) {
+                v.push(m.to_string());
+            }
+        }
+    }
+    v
+}
+
+/// The Lean names (without the namespace) of every function of the
+/// solution's Aeneas translation, loops included.
+fn model_names(cfg: &Config) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    let Ok(text) = fs::read_to_string(cfg.translation_path()) else { return v };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { return v };
+    for f in json["functions"].as_array().into_iter().flatten() {
+        if let Some(lean) = f["lean_name"].as_str() {
+            v.push(lean.strip_prefix(&format!("{}.", cfg.ns)).unwrap_or(lean).to_string());
+        }
+    }
+    v
+}
+
+/// Does a segment mention the Aeneas model of one of `funcs` (`<module>.f`,
+/// `<module>.f_loop…`) that the current translation no longer has: a lemma
+/// about an implementation that was removed?
+fn mentions_gone_model(segment: &str, funcs: &[String], ns: &str, modules: &[String], models: &[String]) -> Option<String> {
+    for word in segment.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '\'' || c == '«' || c == '»')) {
+        let w = word.trim_matches('.');
+        let w = w.strip_prefix(&format!("{ns}.")).unwrap_or(w);
+        for f in funcs {
+            if let Some(model) = model_of(w, f, modules) {
+                if !models.iter().any(|x| *x == model) {
+                    return Some(f.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The model of `f` a word names (`<module>.f`, `<module>.f_loop…`, or a
+/// constant of one, `<module>.f_loop.body`), for a module of `modules`.
+fn model_of(w: &str, f: &str, modules: &[String]) -> Option<String> {
+    for m in modules {
+        let Some(rest) = w.strip_prefix(m.as_str()).and_then(|r| r.strip_prefix('.')) else { continue };
+        let first = rest.split('.').next().unwrap_or("");
+        if first == f || first.strip_prefix(&format!("{f}_loop")).is_some_and(|r| r.bytes().all(|b| b.is_ascii_digit())) {
+            return Some(format!("{m}.{first}"));
         }
     }
     None
@@ -525,10 +707,14 @@ fn archive_stale(cfg: &Config, lowered: &[Lowered], cx: &EmitCx, log: &mut Log, 
             }
         }
     }
-    if removed.is_empty() {
-        return Ok(());
-    }
+    // obligations that vanished from declarations that remain (a `wf` with nothing left to
+    // check, say) are archived too, even when no declaration was removed
     let current_obligations: std::collections::HashSet<String> = lowered.iter().flat_map(|d| emit::obligations(cx, d).into_iter().map(|o| o.name)).collect();
+    let modules = model_modules(cfg);
+    let models = model_names(cfg);
+    // funcs of the specification without an implementation (any more), once
+    // Aeneas has run: lemmas about their old models cannot elaborate
+    let unimplemented: Vec<String> = if cx.has_funs { lowered.iter().filter(|d| d.kind == Kind::Func && !cx.impl_names.contains_key(&d.name)).map(|d| d.name.clone()).collect() } else { Vec::new() };
     let mut stale_lean = String::new();
     let mut stale_rust = String::new();
     let mut notes = Vec::new();
@@ -540,15 +726,24 @@ fn archive_stale(cfg: &Config, lowered: &[Lowered], cx: &EmitCx, log: &mut Log, 
         for seg in lean_segments(&text) {
             let mut drop = false;
             if removable(&seg) {
-                if let Some(n) = mentions(&seg, &removed) {
+                if let Some(n) = mentions(&seg, &removed, &cfg.ns, &modules) {
                     drop = true;
                     n_removed += 1;
                     stale_lean.push_str(&format!("-- stale: mentions removed declaration `{n}`\n"));
+                } else if let Some(f) = mentions_gone_model(&seg, &unimplemented, &cfg.ns, &modules, &models) {
+                    drop = true;
+                    n_vanished += 1;
+                    stale_lean.push_str(&format!("-- stale: mentions the Aeneas model of `{f}`, which is no longer implemented\n"));
                 } else if let Some(name) = seg.lines().find_map(|l| l.strip_prefix("theorem ").map(|r| r.split(|c: char| c.is_whitespace() || c == ':').next().unwrap_or("").to_string())) {
                     // an obligation theorem (`decl.kind`) for a declaration that still exists
                     if let Some((decl, ob)) = name.rsplit_once('.') {
                         let known = emit::is_obligation_kind(ob);
-                        if known && current.contains(decl) && !current_obligations.contains(&name) {
+                        // `impl_correct` and `exists` are obligations only once the Aeneas
+                        // model exists: their proofs are not stale before Aeneas has run
+                        // at all. Once it has, a func without them has no implementation
+                        // (any more): a proof about the one that was is stale
+                        let model_pending = matches!(ob, "impl_correct" | "exists") && !cx.has_funs;
+                        if known && current.contains(decl) && !current_obligations.contains(&name) && !model_pending {
                             drop = true;
                             n_vanished += 1;
                             stale_lean.push_str(&format!("-- stale: obligation `{name}` no longer exists\n"));
@@ -569,7 +764,7 @@ fn archive_stale(cfg: &Config, lowered: &[Lowered], cx: &EmitCx, log: &mut Log, 
                 notes.push(format!("{n_removed} Lean declaration(s) about removed {}", removed.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")));
             }
             if n_vanished > 0 {
-                notes.push(format!("{n_vanished} theorem(s) of obligations that no longer exist"));
+                notes.push(format!("{n_vanished} theorem(s) of obligations that no longer exist or about implementations that do not"));
             }
         }
     }
@@ -694,6 +889,31 @@ pub fn translate(cfg: &Config, log: &mut Log) -> Result<Vec<Lowered>, String> {
 /// `archive_rust = false` while verifying from a jail: the jail would push the
 /// removed function back on its next verify, so the human's own `translate`
 /// does that archiving.
+/// A crate-root `build.rs` that reruns when anything under the solution or the
+/// proofs changes: the build gate (`djinn!`) tracks the files it knew of, and
+/// stable proc macros cannot track a directory, so a newly added file would
+/// otherwise reach the gate only with the next rebuild. Written once; a crate
+/// with a build script of its own is told what to add.
+fn gate_build_script(cfg: &Config, log: &mut Log) -> Result<(), String> {
+    let lines = [cfg.rel(&cfg.solution_dir()), cfg.rel(&cfg.lean_dir())].map(|d| d.replace('\\', "/")).map(|d| format!("cargo:rerun-if-changed={d}"));
+    let path = cfg.crate_dir.join("build.rs");
+    let manifest = fs::read_to_string(cfg.crate_dir.join("Cargo.toml")).unwrap_or_default();
+    let own = manifest.lines().any(|l| l.trim_start().starts_with("build") && l.contains('='));
+    match fs::read_to_string(&path) {
+        Ok(t) if lines.iter().all(|l| t.contains(l.as_str())) => Ok(()),
+        Err(_) if !own => {
+            let body: String = lines.iter().map(|l| format!("    println!(\"{l}\");\n")).collect();
+            fs::write(&path, format!("// Written by `cargo djinn translate`: rebuild (and so rerun the djinn build\n// gate) when a file is added under the solution or the proofs.\nfn main() {{\n{body}}}\n")).map_err(|e| format!("build.rs: {e}"))?;
+            log.line("wrote build.rs (reruns the build gate when files are added)");
+            Ok(())
+        }
+        _ => {
+            log.line(&format!("note: the crate has a build script of its own; add `{}` to it so the build gate sees newly added files", lines.join("`, `")));
+            Ok(())
+        }
+    }
+}
+
 pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result<Vec<Lowered>, String> {
     let prog = parse_spec(cfg)?;
     let tn = type_names(cfg, &prog);
@@ -706,10 +926,12 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
     if !cfg.solution_dir().join("mod.rs").exists() {
         fs::write(cfg.solution_dir().join("mod.rs"), "//! LLM-owned: the implementation of the `func`s of the specification.\n").map_err(|e| e.to_string())?;
     }
+    gate_build_script(cfg, log)?;
     // user types are Rust enums and structs, and ambient functions are Rust
     // code: `Spec.lean` needs their Aeneas translation, so the pipeline runs
     // once before the first translate
-    if (needs_types(&lowered) && !types_available(cfg, &prog)) || !ambient_available(cfg, &prog) {
+    let ambient_stale = !ambient_used(&prog).is_empty() && !types_recorded(cfg, &prog);
+    if (needs_types(&lowered) && !types_available(cfg, &prog)) || !ambient_available(cfg, &prog) || ambient_stale {
         log.line("the specification mentions user types or ambient functions whose Lean translation Aeneas has not produced yet: running Charon and Aeneas once");
         aeneas_pipeline(cfg, log).map_err(|(_, e)| e)?;
     }
@@ -722,8 +944,15 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
         fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"))
     };
     w("Vocab.lean", emit::vocab_lean())?;
+    let tables = spec_tables(&prog);
+    if tables.is_empty() {
+        let _ = fs::remove_file(dir.join("Tables.lean"));
+    } else {
+        w("Tables.lean", emit::tables_lean(&cfg.ns, &tables))?;
+    }
     w("Spec.lean", emit::spec_lean(&cx, &lowered))?;
     w("Obligations.lean", emit::obligations_lean(&cx, &lowered))?;
+    w("Statements.lean", emit::statements_lean(&cx, &lowered))?;
     w("Audit.lean", emit::audit_lean(&cx, &lowered))?;
     if !dir.join("Proofs.lean").exists() {
         w("Proofs.lean", emit::proofs_skeleton(&cx, &lowered))?;
@@ -743,6 +972,27 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
             };
             fs::write(&path, &text).map_err(|e| e.to_string())?;
             log.line(&format!("added `{}` to Proofs.lean", ci.trim_end()));
+        }
+        // a stub still as generated (`sorry`, nothing else) whose statement is
+        // no longer the obligation's: the specification changed under it;
+        // the current stub replaces it (a theorem with any proof stays)
+        let current: HashMap<String, String> = lowered.iter().flat_map(|d| emit::obligations(&cx, d)).filter(|o| o.generated_proof.is_none()).map(|o| (o.name.clone(), emit::stub_text(&o))).collect();
+        let mut refreshed = Vec::new();
+        let mut rebuilt = String::new();
+        for seg in lean_segments(&text) {
+            let name = seg.strip_prefix("theorem ").and_then(|r| r.split(|c: char| c.is_whitespace() || c == ':').next()).unwrap_or("");
+            match current.get(name) {
+                Some(stub) if seg.trim_end().ends_with(":= by\n  sorry") && seg.matches(":= by").count() == 1 && seg.trim_end() != stub.trim_end() => {
+                    refreshed.push(name.to_string());
+                    rebuilt.push_str(stub);
+                }
+                _ => rebuilt.push_str(&seg),
+            }
+        }
+        if !refreshed.is_empty() {
+            text = rebuilt;
+            fs::write(&path, &text).map_err(|e| e.to_string())?;
+            log.line(&format!("refreshed {} untouched stub(s) in Proofs.lean whose statement changed: {}", refreshed.len(), refreshed.join(", ")));
         }
         let mut missing = Vec::new();
         for d in &lowered {
@@ -780,7 +1030,7 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
     // an initial report, so that `cargo build` can say "never attempted"
     // precisely and the macro has a file to track
     if !Report::path(cfg).exists() {
-        let mut r = Report { time: now(), duration_secs: 0, pass: false, stage: "not run".into(), obligations: BTreeMap::new(), declarations: decl_statuses(cfg, &lowered, &names), errors: Vec::new(), log_tail: Vec::new() };
+        let mut r = Report { time: now(), duration_secs: 0, pass: false, stage: "not run".into(), obligations: BTreeMap::new(), declarations: decl_statuses(cfg, &lowered, &names), errors: Vec::new(), log_tail: Vec::new(), evidence: String::new() };
         for d in &r.declarations {
             for o in &d.obligations {
                 r.obligations.insert(o.clone(), "unverified".into());
@@ -866,13 +1116,20 @@ pub fn verify(cfg: &Config, jail: Option<&Path>, log: &mut Log) -> Report {
         declarations: Vec::new(),
         errors: Vec::new(),
         log_tail: Vec::new(),
+        evidence: String::new(),
     };
     let result = verify_inner(cfg, jail, log, &mut report);
     match result {
         Ok(()) => {
             report.pass = true;
             report.stage = "done".into();
-            log.line("PASS");
+            let missing = report.unimplemented();
+            if missing.is_empty() {
+                log.line("PASS");
+            } else {
+                // not the crate's PASS: the gate refuses it until every `fn` is implemented
+                log.line(&format!("SPECIFICATION VERIFIED: every obligation so far is proved; not implemented yet: {} (run `cargo djinn implement`)", missing.join(", ")));
+            }
         }
         Err((stage, msg)) => {
             report.pass = false;
@@ -935,13 +1192,27 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
     for t in prog.types.enums.keys().chain(prog.types.structs.keys()) {
         charon.arg(path(t));
     }
+    // the specification's tables stay opaque: Aeneas would spell each as a
+    // list of scalar literals, which Lean cannot elaborate at the sizes codecs
+    // need; the model library defines them from `Spec.lean`'s packed form
+    for n in table_names(&prog) {
+        charon.arg(format!("--opaque={}::{n}", cfg.rust_module("crate", module_of(&specs, &prog, &n).as_deref())));
+    }
     // and only the library target: binaries (`src/main.rs`, `src/bin/`) are
     // drivers, which Charon must not even compile
     charon.args(["--", "--lib"]);
     run(&mut charon, "charon", log).map_err(|e| stage("charon", e))?;
+    // 2b. what Aeneas would print unescaped into Code/ (string and char
+    // literals, source paths in doc comments) must not be able to spell Lean
+    let llbc_text = fs::read_to_string(&llbc).map_err(|e| stage("charon", format!("{}: {e}", llbc.display())))?;
+    let llbc_json: serde_json::Value = serde_json::from_str(&llbc_text).map_err(|e| stage("charon", format!("{}: {e}", llbc.display())))?;
+    if let Some(bad) = unprintable_literals(&llbc_json).into_iter().next() {
+        return Err(stage("literals", format!("FAIL: {bad}")));
+    }
     // 3. aeneas, regenerating Code/ from scratch
     let code_dir = cfg.lean_dir().join("Code");
     let _ = fs::remove_dir_all(&code_dir);
+    let _ = fs::remove_file(types_record_path(cfg));
     run(
         Command::new(&cfg.aeneas)
             .args(["-backend", "lean"])
@@ -963,20 +1234,122 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
             return Err(stage("escape hatch", format!("FAIL: local function {} is opaque (no escape hatches)", f["rust_name"])));
         }
     }
+    // Rust string literals: Aeneas proves `toStr`'s length bound with
+    // `decide +native`, an axiom the audit rejects; the same bound by kernel
+    // reduction instead (the `Str` is the same — only the proof differs)
+    for e in fs::read_dir(&code_dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "lean") && !p.file_name().is_some_and(|n| n.to_string_lossy().contains("_Template")) {
+            if let Ok(text) = fs::read_to_string(&p) {
+                let fixed = kernel_str_literals(&text);
+                if fixed != text {
+                    fs::write(&p, fixed).map_err(|e| stage("aeneas", e.to_string()))?;
+                }
+            }
+        }
+    }
     if code_dir.join("FunsExternal_Template.lean").exists() || code_dir.join("TypesExternal_Template.lean").exists() {
         // externals with a model in the library are written as definitions
         // (trusted); any other is a failure with an explanation
         let patterns = external_patterns(&code_dir);
-        match crate::models::cover(&cfg.ns, &patterns) {
+        match crate::models::cover(&cfg.ns, &patterns, &table_models(cfg, &prog)) {
             Ok((funs, types)) => {
                 fs::write(code_dir.join("FunsExternal.lean"), funs).map_err(|e| stage("externals", e.to_string()))?;
                 fs::write(code_dir.join("TypesExternal.lean"), types).map_err(|e| stage("externals", e.to_string()))?;
-                log.line(&format!("modeled {} standard-library item(s) the solution uses (String / HashMap and their helpers), from the trusted model library", patterns.len()));
+                log.line(&format!("modeled {} item(s) the solution uses (standard-library methods and types, the specification's tables), from the trusted model library", patterns.len()));
             }
             Err(uncovered) => return Err(stage("externals", explain_externals(cfg, &uncovered))),
         }
     }
+    // what `Code/` now translates (see `types_available`)
+    fs::write(types_record_path(cfg), types_record(cfg, &prog)).map_err(|e| stage("aeneas", e.to_string()))?;
     Ok(())
+}
+
+/// Text in Charon's output that Aeneas would print into `Code/` without the
+/// escaping Lean needs: Aeneas writes a string literal as `"…"` escaping only
+/// `\` and control characters (and those as `\ddd`, which Lean does not
+/// read), a char as `'…'` escaping nothing, and source paths into `/-- … -/`.
+/// A `"` in a literal ends the Lean string early, and what follows would be
+/// Lean code. Allowed: printable ASCII without `"` and `\` (in a char also
+/// without `'`); no `/-` or `-/` in any other string (paths, names).
+fn unprintable_literals(v: &serde_json::Value) -> Vec<String> {
+    fn plain(s: &str, quote: char) -> bool {
+        s.chars().all(|c| (' '..='~').contains(&c) && c != '"' && c != '\\' && c != quote)
+    }
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, x) in m {
+                    match (k.as_str(), x) {
+                        // Charon's own options (its output path) and the files'
+                        // source text: not printed by Aeneas
+                        ("options" | "contents", _) => {}
+                        ("Str", serde_json::Value::String(s)) if !plain(s, '"') => out.push(format!("the string literal {s:?} in the solution cannot be translated safely: Aeneas would print it into Lean unescaped. Use printable ASCII without `\"` and `\\` (build other text from bytes)")),
+                        ("Char", serde_json::Value::String(s)) if !plain(s, '\'') => out.push(format!("the char literal {s:?} in the solution cannot be translated safely: Aeneas would print it into Lean unescaped. Use a `u8` or `u32` code instead")),
+                        (_, serde_json::Value::String(s)) if s.contains("/-") || s.contains("-/") => out.push(format!("{s:?} (a name or source path in the translated program) holds `/-` or `-/`, which Aeneas would print into a Lean comment: rename it")),
+                        _ => walk(x, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            serde_json::Value::String(s) if s.contains("/-") || s.contains("-/") => out.push(format!("{s:?} (a name or source path in the translated program) holds `/-` or `-/`, which Aeneas would print into a Lean comment: rename it")),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, &mut out);
+    out
+}
+
+/// The proof of `toStr`'s bound (`s.toByteArray.size ≤ U32.max`) given to every
+/// `toStr "…"` of Aeneas's output: `U32.max` is irreducible, so it is rewritten
+/// to its numeral first; the literal's size then reduces in the kernel.
+const STR_BOUND: &str = "(by rw [show Aeneas.Std.U32.max = 4294967295 by scalar_tac]; decide +kernel)";
+
+/// `toStr "…"` → `toStr "…" STR_BOUND`, for each call without an explicit proof.
+fn kernel_str_literals(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut last = 0;
+    while let Some(k) = text[i..].find("toStr") {
+        let s = i + k;
+        let after = s + "toStr".len();
+        i = after;
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'\'';
+        if (s > 0 && ident(b[s - 1])) || (after < b.len() && ident(b[after])) {
+            continue;
+        }
+        // the literal: whitespace, then `"` … `"` (with `\` escapes)
+        let mut j = after;
+        while j < b.len() && (b[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b'"' {
+            continue;
+        }
+        let mut q = j + 1;
+        while q < b.len() && b[q] != b'"' {
+            q += if b[q] == b'\\' { 2 } else { 1 };
+        }
+        if q >= b.len() {
+            break;
+        }
+        let end = q + 1;
+        // already given a proof?
+        let rest = text[end..].trim_start();
+        if rest.starts_with("(by") {
+            continue;
+        }
+        out.push_str(&text[last..end]);
+        out.push(' ');
+        out.push_str(STR_BOUND);
+        last = end;
+        i = end;
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 /// The `Name pattern`s of the items Aeneas could not model.
@@ -984,13 +1357,28 @@ fn external_patterns(code_dir: &Path) -> Vec<String> {
     let mut patterns: Vec<String> = Vec::new();
     for f in ["TypesExternal_Template.lean", "FunsExternal_Template.lean"] {
         if let Ok(text) = fs::read_to_string(code_dir.join(f)) {
-            for l in text.lines() {
-                if let Some(rest) = l.trim().strip_prefix("Name pattern: [") {
-                    let pat = rest.trim_end_matches(']').to_string();
-                    if !patterns.contains(&pat) {
-                        patterns.push(pat);
-                    }
+            // each item's doc comment opens `/-- [path]`; functions and types
+            // also name a `Name pattern`, globals (the opaque tables) do not
+            let mut header: Option<String> = None;
+            let push = |pat: String, patterns: &mut Vec<String>| {
+                if !patterns.contains(&pat) {
+                    patterns.push(pat);
                 }
+            };
+            for l in text.lines() {
+                let l = l.trim();
+                if let Some(rest) = l.strip_prefix("/-- [") {
+                    if let Some(h) = header.take() {
+                        push(h, &mut patterns);
+                    }
+                    header = rest.split(']').next().map(|h| h.to_string());
+                } else if let Some(rest) = l.strip_prefix("Name pattern: [") {
+                    header = None;
+                    push(rest.trim_end_matches(']').to_string(), &mut patterns);
+                }
+            }
+            if let Some(h) = header {
+                push(h, &mut patterns);
             }
         }
     }
@@ -1070,13 +1458,50 @@ fn verify_inner(cfg: &Config, jail: Option<&Path>, log: &mut Log, report: &mut R
         }
         report.declarations = decl_statuses(cfg, &lowered, &impl_names(cfg));
     }
+    // what Charon reads (the crate's sources, the solution): snapshotted
+    // first, so that the evidence attests the very bytes translated
+    let mut sources = source_snapshot(cfg);
     // 1–4. build, Charon, Aeneas, audit
     aeneas_pipeline(cfg, log)?;
     // 5. regenerate the trusted files
-    translate_opts(cfg, log, jail.is_none()).map_err(|e| stage("translate", e))?;
-    report.declarations = decl_statuses(cfg, &lowered, &impl_names(cfg));
-    // 6. lake build
-    match run(Command::new("lake").arg("build").current_dir(&cfg.proofs), "lake build", log) {
+    let mut lowered = translate_opts(cfg, log, jail.is_none()).map_err(|e| stage("translate", e))?;
+    if source_snapshot(cfg) != sources {
+        // translate archived the implementations of removed declarations:
+        // Charon read the solution before that, so once more on what is left
+        log.line("the solution changed during translate (archived functions): translating it again");
+        sources = source_snapshot(cfg);
+        aeneas_pipeline(cfg, log)?;
+        lowered = translate_opts(cfg, log, jail.is_none()).map_err(|e| stage("translate", e))?;
+        if source_snapshot(cfg) != sources {
+            return Err(stage("evidence", "FAIL: the crate's sources changed while they were being verified; verify again".into()));
+        }
+    }
+    let names = impl_names(cfg);
+    report.declarations = decl_statuses(cfg, &lowered, &names);
+    report.obligations.clear();
+    for d in &report.declarations {
+        for o in &d.obligations {
+            report.obligations.insert(o.clone(), "unverified".into());
+        }
+    }
+    // what this verify attests: the solution and proof files as they are now,
+    // after translate has added or refreshed stubs (an edit from here on makes
+    // the build gate refuse the crate until the next verify)
+    report.evidence = evidence(cfg);
+    if let Some(why) = report.evidence.strip_prefix("invalid: ") {
+        return Err(stage("evidence", format!("FAIL: the solution and proof files cannot be fingerprinted: {why}")));
+    }
+    // the audit program as translated now (written again right before it
+    // runs: nothing the build does to the file counts)
+    let prog = parse_spec(cfg).map_err(|e| stage("specification", e))?;
+    let tn = type_names(cfg, &prog);
+    let cx = emit_cx(cfg, &lowered, &names, &tn);
+    let audit_text = emit::audit_lean(&cx, &lowered);
+    let short: Vec<String> = lowered.iter().flat_map(|d| emit::obligations(&cx, d)).map(|o| o.name).collect();
+    // 6. lake build, and the statements elaborated without the proofs
+    let built = run(Command::new("lake").arg("build").current_dir(&cfg.proofs), "lake build", log)
+        .and_then(|text| run(Command::new("lake").args(["build", &format!("{}.Statements", cfg.ns)]).current_dir(&cfg.proofs), "lake build (statements)", log).map(|t| text + &t));
+    match built {
         Ok(text) => {
             if text.contains("declaration uses 'sorry'") || text.contains("declaration uses `sorry`") {
                 log.line("note: proofs still contain sorry (the axiom audit will reject them)");
@@ -1091,38 +1516,260 @@ fn verify_inner(cfg: &Config, jail: Option<&Path>, log: &mut Log, report: &mut R
         }
     }
     // 7. axiom audit
-    let audit = run(
-        Command::new("lake").args(["env", "lean"]).arg(format!("{}/Audit.lean", cfg.ns)).current_dir(&cfg.proofs),
-        "axiom audit",
-        log,
-    )
-    .map_err(|e| stage("axiom audit", e))?;
-    let allowed = ["propext", "Classical.choice", "Quot.sound"];
-    let prefix = format!("{}.Obligations.", cfg.ns);
+    let audit_rel = format!("{}/Audit.lean", cfg.ns);
+    fs::write(cfg.proofs.join(&audit_rel), &audit_text).map_err(|e| stage("axiom audit", format!("{audit_rel}: {e}")))?;
+    let audit = run(Command::new("lake").args(["env", "lean", AUDIT_TSTACK, "--run"]).arg(&audit_rel).current_dir(&cfg.proofs), "axiom audit", log).map_err(|e| stage("axiom audit", e))?;
+    let verdicts = parse_audit(&audit, &short).map_err(|e| {
+        for o in report.obligations.values_mut() {
+            *o = "error".into();
+        }
+        stage("axiom audit", format!("FAIL: axiom audit: {e}\n{}", audit.lines().take(40).collect::<Vec<_>>().join("\n")))
+    })?;
     let mut bad = Vec::new();
-    for line in audit.lines() {
-        let name_of = |l: &str| l.trim_start_matches('\'').split('\'').next().unwrap_or("").trim_start_matches(&prefix).to_string();
-        if line.contains("does not depend on any axioms") {
-            report.obligations.insert(name_of(line), "proved".into());
-            continue;
-        }
-        if let Some((name, rest)) = line.split_once("depends on axioms:") {
-            let axioms: Vec<&str> = rest.trim().trim_start_matches('[').trim_end_matches(']').split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-            let extra: Vec<&str> = axioms.iter().copied().filter(|a| !allowed.contains(a)).collect();
-            let n = name_of(name);
-            if extra.is_empty() {
-                report.obligations.insert(n, "proved".into());
-            } else {
-                let status = if extra.contains(&"sorryAx") { "sorry".to_string() } else { format!("axiom:{}", extra.join(",")) };
-                report.obligations.insert(n.clone(), status);
-                bad.push(format!("{n} uses {}", extra.join(", ")));
+    for (n, v) in short.iter().zip(&verdicts) {
+        let status = match v {
+            AuditVerdict::Ok => "proved".to_string(),
+            AuditVerdict::Sorry => {
+                bad.push(format!("{n} uses sorryAx"));
+                "sorry".into()
             }
-        } else if line.contains("error") {
-            bad.push(line.to_string());
-        }
+            AuditVerdict::Axioms(a) => {
+                // `native_decide` / `decide +native` trust compiled code: say how to avoid it
+                let hint = if a.contains("_native") {
+                    format!(" — `decide +native`/`native_decide` (also the default proof of `toStr \"…\"` written in a proof): use `decide +kernel`, and give `toStr \"…\"` the bound explicitly: `toStr \"…\" {STR_BOUND}`")
+                } else {
+                    String::new()
+                };
+                bad.push(format!("{n} uses {a}{hint}"));
+                format!("axiom:{a}")
+            }
+            AuditVerdict::Statement(why) => {
+                bad.push(format!("{n}: {why}"));
+                "error".into()
+            }
+            AuditVerdict::Replay(why) => {
+                // one rejection fails every obligation that reaches it: said once
+                let msg = format!("the kernel rejects what the obligations depend on: {why}");
+                if !bad.contains(&msg) {
+                    bad.push(msg);
+                }
+                "error".into()
+            }
+        };
+        report.obligations.insert(n.clone(), status);
     }
     if !bad.is_empty() {
         return Err(stage("axiom audit", format!("FAIL: axiom audit\n  {}", bad.join("\n  "))));
     }
+    // 8. the files verified are still the files on disk (Lake may have written
+    // its manifest: what it built with is what counts)
+    let after = evidence(cfg);
+    if after != report.evidence {
+        let manifest = format!(" {}", cfg.rel(&cfg.proofs.join("lake-manifest.json")));
+        let body = |r: &str| -> Vec<String> { r.lines().skip(1).filter(|l| !l.ends_with(&manifest)).map(|s| s.to_string()).collect() };
+        if body(&after) == body(&report.evidence) && !after.starts_with("invalid: ") {
+            report.evidence = after;
+        } else {
+            return Err(stage("evidence", "FAIL: the solution or proof files changed while they were being verified; verify again".into()));
+        }
+    }
+    if source_snapshot(cfg) != sources {
+        return Err(stage("evidence", "FAIL: the crate's sources changed while they were being verified; verify again".into()));
+    }
     Ok(())
+}
+
+/// The bytes of everything Charon and the specification parser read: the
+/// manifest, `src/` and the solution directory.
+fn source_snapshot(cfg: &Config) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn walk(d: &Path, out: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        for e in fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.insert(p.clone(), fs::read(&p).unwrap_or_default());
+            }
+        }
+    }
+    let mut m = BTreeMap::new();
+    let manifest = cfg.crate_dir.join("Cargo.toml");
+    m.insert(manifest.clone(), fs::read(&manifest).unwrap_or_default());
+    walk(&cfg.crate_dir.join("src"), &mut m);
+    walk(&cfg.solution_dir(), &mut m);
+    m
+}
+
+/// The fingerprint of the crate's solution and proof files (see the build gate).
+pub fn evidence(cfg: &Config) -> String {
+    djinn_syntax::project::evidence_record(&cfg.crate_dir, &cfg.solution_dir(), &cfg.proofs, &cfg.ns)
+}
+
+/// The audit replays proofs in the kernel on a thread of this stack size (in
+/// KiB; address space reserved, not memory used): the kernel recurses as deep
+/// as a proof term is, and gzip-sized proofs overflow a default 8 MiB stack.
+const AUDIT_TSTACK: &str = "--tstack=1048576";
+
+/// The audit's judgement of one obligation (see `emit::audit_lean`).
+#[derive(Debug, PartialEq)]
+enum AuditVerdict {
+    Ok,
+    Sorry,
+    /// The axioms beyond the allowed ones, for the message.
+    Axioms(String),
+    /// Its statement is not the specification's.
+    Statement(String),
+    /// The kernel rejected a constant the obligations reach.
+    Replay(String),
+}
+
+/// Read `Audit.lean`'s output: one verdict per obligation, in order. Only its
+/// own records count, each exactly once, and the replay and the end marker
+/// must be there; anything else — a missing, repeated or unknown record, any
+/// other output — fails the audit.
+fn parse_audit(out: &str, obligations: &[String]) -> Result<Vec<AuditVerdict>, String> {
+    let mut v: Vec<Option<AuditVerdict>> = obligations.iter().map(|_| None).collect();
+    let mut replay: Option<Result<(), String>> = None;
+    let mut ended = false;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if ended {
+            return Err(format!("output after the end of the audit: {line}"));
+        }
+        let rest = line.strip_prefix("djinn-audit ").ok_or_else(|| format!("unexpected output: {line}"))?;
+        let (head, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+        match head {
+            "replay" if replay.is_none() => {
+                replay = Some(if tail.starts_with("ok ") { Ok(()) } else { Err(tail.strip_prefix("fail ").ok_or_else(|| format!("unexpected output: {line}"))?.to_string()) });
+            }
+            "end" if tail == obligations.len().to_string() && replay.is_some() => ended = true,
+            _ => {
+                let i: usize = head.parse().map_err(|_| format!("unexpected output: {line}"))?;
+                let slot = v.get_mut(i).ok_or_else(|| format!("no obligation {i}: {line}"))?;
+                if slot.is_some() || replay.is_some() {
+                    return Err(format!("unexpected record: {line}"));
+                }
+                let (kind, arg) = tail.split_once(' ').unwrap_or((tail, ""));
+                *slot = Some(match (kind, arg) {
+                    ("ok", "") => AuditVerdict::Ok,
+                    ("sorry", "") => AuditVerdict::Sorry,
+                    ("axioms", a) if !a.is_empty() => AuditVerdict::Axioms(a.to_string()),
+                    ("statement", w) if !w.is_empty() => AuditVerdict::Statement(w.to_string()),
+                    _ => return Err(format!("unexpected record: {line}")),
+                });
+            }
+        }
+    }
+    if !ended {
+        return Err("the audit did not finish".into());
+    }
+    let replay = replay.unwrap_or_else(|| Err("no replay".into()));
+    v.into_iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let x = x.ok_or_else(|| format!("no verdict for {}", obligations[i]))?;
+            Ok(match (&replay, x) {
+                (Err(why), AuditVerdict::Ok) => AuditVerdict::Replay(why.clone()),
+                (_, x) => x,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn string_literals_get_a_kernel_proof() {
+        let s = "let s ← f (toStr\n        \"div \\\"by\\\" zero\")\n  ok (toStr \"x\" (by decide))\n  myToStr \"y\"";
+        let r = super::kernel_str_literals(s);
+        assert!(r.contains("(toStr\n        \"div \\\"by\\\" zero\" (by rw [show"), "{r}");
+        assert_eq!(r.matches("decide +kernel").count(), 1, "{r}");
+        assert!(r.contains("myToStr \"y\""), "{r}");
+    }
+
+    #[test]
+    fn audit_records_are_exact() {
+        use super::AuditVerdict as V;
+        let obs = vec!["f.unambiguous".to_string(), "f.ens_0".to_string()];
+        let good = "djinn-audit 0 ok\ndjinn-audit 1 axioms NS.Proofs.evil\ndjinn-audit replay ok 7\ndjinn-audit end 2\n";
+        assert_eq!(super::parse_audit(good, &obs).unwrap(), vec![V::Ok, V::Axioms("NS.Proofs.evil".into())]);
+        // the old forgery: an axiom named like Lean's clean verdict is just an axiom
+        let named = "djinn-audit 0 axioms «x does not depend on any axioms»\ndjinn-audit 1 ok\ndjinn-audit replay ok 7\ndjinn-audit end 2\n";
+        assert!(matches!(&super::parse_audit(named, &obs).unwrap()[0], V::Axioms(_)));
+        // a kernel rejection fails every obligation that looked proved
+        let replay = "djinn-audit 0 ok\ndjinn-audit 1 sorry\ndjinn-audit replay fail bad\ndjinn-audit end 2\n";
+        assert_eq!(super::parse_audit(replay, &obs).unwrap(), vec![V::Replay("bad".into()), V::Sorry]);
+        // anything unexpected fails closed
+        for bad in [
+            "djinn-audit 0 ok\ndjinn-audit replay ok 7\ndjinn-audit end 2\n",                                         // missing
+            "djinn-audit 0 ok\ndjinn-audit 0 ok\ndjinn-audit 1 ok\ndjinn-audit replay ok 7\ndjinn-audit end 2\n",   // twice
+            "djinn-audit 0 ok\ndjinn-audit 1 ok\ndjinn-audit replay ok 7\n",                                          // unfinished
+            "djinn-audit 0 ok\ndjinn-audit 1 ok\ndjinn-audit end 2\n",                                                // no replay
+            "'NS.Obligations.f.ens_0' does not depend on any axioms\ndjinn-audit 0 ok\ndjinn-audit 1 ok\ndjinn-audit replay ok 7\ndjinn-audit end 2\n",
+            "djinn-audit 0 ok\ndjinn-audit 1 ok\ndjinn-audit 2 ok\ndjinn-audit replay ok 7\ndjinn-audit end 2\n",
+            "djinn-audit 0 ok\ndjinn-audit 1 fine\ndjinn-audit replay ok 7\ndjinn-audit end 2\n",
+        ] {
+            assert!(super::parse_audit(bad, &obs).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn stale_segments_are_matched_by_exact_names() {
+        let removed = vec!["min".to_string()];
+        let modules = vec!["solution".to_string(), "spec".to_string()];
+        let m = |s: &str| super::mentions(s, &removed, "NS", &modules);
+        // a lemma that merely uses a Mathlib name starting with `min_` stays
+        assert_eq!(m("theorem clamp.helper : a ≤ b := by\n  exact min_le_left a b\n"), None);
+        assert_eq!(m("theorem foo : Nat.min 1 2 = 1 := rfl\n"), None);
+        assert_eq!(m("theorem foo : min.ens_bound := x\n"), None);
+        // its definitions, obligations, model, and helpers named after it go
+        for s in [
+            "theorem x : min_spec a b r := h\n",
+            "theorem x : True := by simp [NS.Spec.min_pre]\n",
+            "theorem x := min.unambiguous\n",
+            "theorem x : solution.min a b = ok r := h\n",
+            "theorem x : NS.solution.min_loop0 a = ok r := h\n",
+            "private theorem min_aux : True := trivial\n",
+            "@[simp]\ntheorem min.ens_0 : True := trivial\n",
+        ] {
+            assert_eq!(m(s), Some("min".to_string()), "{s}");
+        }
+    }
+
+    #[test]
+    fn lemmas_about_a_removed_implementation_are_found() {
+        let modules = vec!["solution".to_string(), "spec".to_string()];
+        let models = vec!["spec.f".to_string(), "solution.g".to_string()];
+        let m = |s: &str| super::mentions_gone_model(s, &["f".to_string()], "NS", &modules, &models);
+        assert_eq!(m("theorem body : NS.solution.f_loop.body x = y := h\n"), Some("f".into()));
+        assert_eq!(m("theorem x : solution.f a = ok r := h\n"), Some("f".into()));
+        // the panicking stub `spec.f` is still translated; `solution.ff` is another function
+        assert_eq!(m("theorem x : spec.f a = fail e := h\n"), None);
+        assert_eq!(m("theorem x : solution.ff a = ok r := h\n"), None);
+    }
+
+    #[test]
+    fn literals_aeneas_cannot_print_are_refused() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert!(super::unprintable_literals(&j(r#"{"options": {"dest_file": "/tmp/-x/-/a"}, "files": [{"name": {"Local": "src/lib.rs"}, "contents": "a /- b"}], "v": {"Value": {"Str": "plain text, it's fine"}}, "c": {"Value": {"Char": "x"}}}"#)).is_empty());
+        for bad in [r#"{"Value": {"Str": "q\" axiom evil : False"}}"#, r#"{"Value": {"Str": "back\\slash"}}"#, r#"{"Value": {"Str": "é"}}"#, r#"{"Value": {"Str": "nl\n"}}"#, r#"{"Value": {"Char": "'"}}"#, r#"{"Value": {"Char": "\\"}}"#, r#"{"files": [{"name": {"Local": "src/a-/b.rs"}}]}"#] {
+            assert_eq!(super::unprintable_literals(&j(bad)).len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn external_patterns_include_globals() {
+        let dir = std::env::temp_dir().join(format!("djinn-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("FunsExternal_Template.lean"),
+            "/-- [core::num::{u64}::count_ones]:\n    Source: x\n    Name pattern: [core::num::{u64}::count_ones]\n    Visibility: public -/\naxiom core.num.U64.count_ones : Std.U64 → Result Std.U32\n\n/-- [bits::spec::K]\n    Source: y\n    Visibility: public -/\naxiom spec.K : Result (Slice Std.U32)\n",
+        )
+        .unwrap();
+        let p = super::external_patterns(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(p, vec!["core::num::{u64}::count_ones".to_string(), "bits::spec::K".to_string()]);
+    }
 }

@@ -27,8 +27,8 @@ theorem lbase_unique (k x y : ℤ) (hx : lbase_spec k x) (hy : lbase_spec k y) :
   | h m ih =>
     rw [lbase_spec] at hx hy
     have hp := hx.1
-    have hxb := (hx.2 hp).2
-    have hyb := (hy.2 hp).2
+    have hxb := (hx.2 hp).2 (hx.2 hp).1
+    have hyb := (hy.2 hp).2 (hy.2 hp).1
     by_cases hz : k = 0
     · exact (hxb.1 hz).trans (hyb.1 hz).symm
     by_cases ht : k = 28
@@ -46,8 +46,8 @@ theorem dbase_unique (k x y : ℤ) (hx : dbase_spec k x) (hy : dbase_spec k y) :
   | h m ih =>
     rw [dbase_spec] at hx hy
     have hp := hx.1
-    have hxb := (hx.2 hp).2
-    have hyb := (hy.2 hp).2
+    have hxb := (hx.2 hp).2 (hx.2 hp).1
+    have hyb := (hy.2 hp).2 (hy.2 hp).1
     by_cases hz : k = 0
     · exact (hxb.1 hz).trans (hyb.1 hz).symm
     obtain ⟨a, ha, e, he, hx⟩ := hxb.2 hz

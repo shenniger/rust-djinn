@@ -12,6 +12,9 @@ open Aeneas Std Result
 set_option linter.unusedSimpArgs false
 set_option linter.unusedVariables false
 set_option linter.unusedTactic false
+set_option maxHeartbeats 1000000
+
+open scoped Classical
 
 namespace SortProg.Spec
 
@@ -44,7 +47,7 @@ def sort_pre (v_old : List I32) : Prop :=
 def sort_spec (v_old : List I32) (v : List I32) : Prop :=
   sort_pre v_old ∧
   perm_spec v_old v ∧
-  (∀ i : ℤ, 0 ≤ i → i < ((v.length : ℤ) - 1) → (v[i.toNat]!).val ≤ (v[(i + 1).toNat]!).val)
+  (∀ i : ℤ, 0 ≤ i → i < ((v.length : ℤ) - 1) → (v[i.toNat]!).val ≤ (v[((i + 1) : ℤ).toNat]!).val)
 
 /-! ## func max -/
 

@@ -6,11 +6,24 @@
 //! 3. Per cycle: checkpoint the verified solution and proofs; run an agent in
 //!    a jail with the workload, the current timing, the acceptance rule and
 //!    the history of earlier attempts; then `verify` — a failure reverts —
-//!    and re-measure — not faster beyond noise and threshold reverts. An
-//!    accepted attempt becomes the new baseline and checkpoint.
-//! 4. Stop after `--cycles`, when the estimated spend reaches `--limit`, or
-//!    on Ctrl-C, which kills the agent and restores the last known-good
-//!    checkpoint.
+//!    and re-measure — not faster beyond noise and threshold reverts (noise:
+//!    the batches' interquartile spread; a result better than the threshold
+//!    but not the noise is re-measured with twice the batches first). Points
+//!    with sizes are judged by their trade-off curve; points without (or all
+//!    of one size) one by one: faster at some, slower at none. An accepted
+//!    attempt becomes the new baseline and checkpoint.
+//! 4. Stop after `--cycles`, when the estimated spend reaches `--limit`, when
+//!    the agent stops on an API error (a usage limit: exit status 5, with the
+//!    error printed), or on Ctrl-C, which kills the agent and restores the
+//!    last known-good checkpoint.
+//!
+//! The history (`.djinnscratch/optimize.json`: the baseline, every attempt
+//! and its verdict, the spend) survives a restart: a new run resumes it,
+//! continues the cycle numbering, and counts `--cycles` and `--limit` over
+//! all runs, so restarts never exceed the budget. A cycle the agent could not
+//! work on (an API error) does not count. The crate as it is — it must
+//! verify — is the starting point, re-measured; `implement -B` and `clean`
+//! archive the history with the implementation it belongs to.
 
 use crate::agent::{self, Opts};
 use crate::bench::{self, fmt_ns, Measurement};
@@ -33,6 +46,12 @@ pub struct OptOpts {
     pub threshold: f64,
     pub agent: Opts,
 }
+
+/// The verdict of a cycle whose agent stopped on an API error.
+const API_ERROR_VERDICT: &str = "agent stopped on an API error";
+
+/// Exit status of `optimize` when the agent stopped on an API error.
+pub const EXIT_API_ERROR: u8 = 5;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Attempt {
@@ -87,6 +106,21 @@ impl OptimizeLog {
         } else {
             1.0
         }
+    }
+    /// The cycles that count toward `--cycles`: every attempt but those the
+    /// agent could not work on (it stopped on an API error).
+    pub fn cycles_done(&self) -> usize {
+        self.attempts.iter().filter(|a| a.verdict != API_ERROR_VERDICT).count()
+    }
+    /// The number of the next cycle: numbering continues across restarts.
+    fn next_cycle(&self) -> usize {
+        self.attempts.iter().map(|a| a.cycle).max().unwrap_or(0) + 1
+    }
+    /// The history of an earlier run, to continue: open again.
+    fn resumed(mut self) -> OptimizeLog {
+        self.finished = None;
+        self.interrupted = false;
+        self
     }
     pub fn summary_line(&self) -> String {
         format!(
@@ -208,6 +242,48 @@ pub fn frontier_verdict(old: &Measurement, new: &Measurement, required: f64, siz
     }
 }
 
+/// The verdict for independent points (`Measurement::independent_points`:
+/// no sizes, or all equal — a frontier would collapse to the fastest point):
+/// no point slower beyond its bar, and some point faster by at least its bar.
+/// A point's bar is `threshold`, or the spread of its batches in either
+/// measurement if larger (with `noisy`; without, the threshold alone).
+pub fn points_verdict(old: &Measurement, new: &Measurement, threshold: f64, noisy: bool) -> Result<f64, String> {
+    let mut best: Option<f64> = None;
+    for op in &old.points {
+        let Some(np) = new.points.iter().find(|p| p.id == op.id) else { return Err(format!("point {} is missing", op.id)) };
+        let bar = if noisy { threshold.max(op.noise()).max(np.noise()) } else { threshold };
+        let gain = 1.0 - np.median_ns / op.median_ns;
+        if gain < -bar {
+            return Err(format!("slower at point {}: {} → {} ({:+.1}%, allowed {:.1}%)", op.id, fmt_ns(op.median_ns), fmt_ns(np.median_ns), -gain * 100.0, bar * 100.0));
+        }
+        if gain >= bar {
+            best = Some(best.map_or(gain, |b: f64| b.max(gain)));
+        }
+    }
+    best.ok_or_else(|| "not faster beyond noise and threshold at any point".to_string())
+}
+
+/// The verdict on `new` against `current`: `Ok(improvement)` or `Err(why)`.
+/// With `noisy`, the bar is the threshold or the batches' spread if larger;
+/// without, the threshold alone (to tell a borderline result, which is
+/// re-measured rather than rejected).
+pub fn judge(current: &Measurement, new: &Measurement, threshold: f64, size_required: f64, noisy: bool) -> Result<f64, String> {
+    if current.independent_points() && new.independent_points() {
+        return points_verdict(current, new, threshold, noisy);
+    }
+    let required = if noisy { threshold.max(current.noise()).max(new.noise()) } else { threshold };
+    if new.is_multi() {
+        frontier_verdict(current, new, required, size_required)
+    } else {
+        let improvement = 1.0 - new.median_ns / current.median_ns;
+        if improvement >= required {
+            Ok(improvement)
+        } else {
+            Err(format!("not faster ({:+.1}%, needed {:.1}%)", improvement * 100.0, required * 100.0))
+        }
+    }
+}
+
 fn point_list(m: &Measurement) -> Vec<(u64, Option<u64>, f64)> {
     m.points.iter().map(|p| (p.id, p.size, p.median_ns)).collect()
 }
@@ -297,6 +373,35 @@ fn checkpoint(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Do the solution and proofs match the last checkpoint?
+fn same_as_checkpoint(cfg: &Config) -> bool {
+    let d = checkpoint_dir(cfg);
+    let proofs = cfg.lean_dir();
+    same_tree(&cfg.solution_dir(), &d.join("solution")) && same_tree(&proofs.join("Proofs.lean"), &d.join("Proofs.lean")) && same_tree(&proofs.join("Proofs"), &d.join("Proofs"))
+}
+
+/// Two files or directory trees with the same names and contents (both
+/// absent counts as the same).
+fn same_tree(a: &Path, b: &Path) -> bool {
+    match (a.is_dir(), b.is_dir()) {
+        (true, true) => {
+            let names = |p: &Path| -> Vec<std::ffi::OsString> {
+                let mut v: Vec<_> = fs::read_dir(p).into_iter().flatten().flatten().map(|e| e.file_name()).collect();
+                v.sort();
+                v
+            };
+            let (na, nb) = (names(a), names(b));
+            na == nb && na.iter().all(|n| same_tree(&a.join(n), &b.join(n)))
+        }
+        (false, false) => match (fs::read(a), fs::read(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            (Err(_), Err(_)) => !a.exists() && !b.exists(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Restore the last known-good state and re-run the verifier so the report
 /// and the generated code match it again.
 fn revert(cfg: &Config, why: &str) -> Result<(), String> {
@@ -352,9 +457,17 @@ you changed and why, and the timing you observed: it becomes the history shown t
         ns = cfg.ns,
         sol = cfg.sol_rel(),
         proofs = cfg.proofs_rel(),
-        goal = if current.is_multi() { "BETTER — faster at every compression ratio, or denser at every speed" } else { "FASTER" },
+        goal = if current.independent_points() { "FASTER — at some point of the workload, and slower at none" } else if current.is_multi() { "BETTER — faster at every compression ratio, or denser at every speed" } else { "FASTER" },
         timing = if current.is_multi() { format!("{}\n\n```\n{}```", current.line(), current.table()) } else { current.line() },
-        rule = if current.is_multi() {
+        rule = if current.independent_points() {
+            format!(
+                "every point is judged on its own (the points' sizes do not trade off against time): no point \
+runs more than {pct:.1}% slower (or its measured noise, if larger) and at least one point runs at least \
+{pct:.1}% faster (or its noise, if larger) on a re-measurement by the harness ({thr:.0}% threshold).",
+                pct = opts.threshold * 100.0,
+                thr = opts.threshold * 100.0
+            )
+        } else if current.is_multi() {
             format!(
                 "the trade-off curve improves, judged as lean-zip judges codecs: every point is (size, time); \
 the achievable frontier is the lower convex hull of the points (mixing two adjacent points reaches the \
@@ -380,9 +493,9 @@ harness ({thr:.0}% threshold, or the measured noise if larger).",
         tableinfo = if current.is_multi() { "; it prints the per-point table (size and time per point)" } else { "; it prints nanoseconds per workload iteration" },
         min = opts.min_time,
     );
-    if !log.attempts.is_empty() {
+    if log.cycles_done() > 0 {
         p.push_str("\n## Earlier attempts (do not repeat what failed)\n\n");
-        for a in &log.attempts {
+        for a in log.attempts.iter().filter(|a| a.verdict != API_ERROR_VERDICT) {
             let t = a.ns.map(|n| format!(" — measured {}", fmt_ns(n))).unwrap_or_default();
             p.push_str(&format!("- attempt {}: {}{}\n  tried: {}\n", a.cycle, a.verdict, t, a.summary.replace('\n', " ")));
         }
@@ -404,9 +517,39 @@ fn size_threshold(opts: &OptOpts) -> f64 {
 
 // -------------------------------------------------------------------- loop
 
-pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String> {
+/// Exit status: 0 some attempt (in this run or an earlier one of the same
+/// history) was accepted, 1 none was, `EXIT_API_ERROR` the agent stopped on
+/// an API error (a usage limit, say).
+pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<u8, String> {
     crate::agent::ensure_no_running_job(cfg)?;
     bench::workload_path(cfg)?;
+    if opts.cycles.is_none() && opts.agent.limit_usd.is_none() {
+        return Err("give --cycles N and/or --limit USD".into());
+    }
+    let prev = OptimizeLog::load(cfg).map(OptimizeLog::resumed);
+    if let Some(p) = &prev {
+        eprintln!(
+            "== optimize: resuming the history in {} — {} cycle(s) so far, {} accepted, {} → {}, spent ~${:.2}",
+            cfg.rel(&OptimizeLog::path(cfg)),
+            p.cycles_done(),
+            p.accepted,
+            fmt_ns(p.baseline_ns),
+            fmt_ns(p.current_ns),
+            p.spent_usd
+        );
+        if let Some(n) = opts.cycles {
+            if p.cycles_done() >= n {
+                eprintln!("== all {n} cycle(s) already ran (`--cycles` counts every run of this history): give a larger --cycles to continue");
+                return Ok(if p.accepted > 0 { 0 } else { 1 });
+            }
+        }
+        if let Some(limit) = opts.agent.limit_usd {
+            if p.spent_usd >= limit {
+                eprintln!("== spending limit already reached (${:.2} of ${limit:.2}, over every run of this history)", p.spent_usd);
+                return Ok(if p.accepted > 0 { 0 } else { 1 });
+            }
+        }
+    }
     // Ctrl-C: stop the agent, restore the checkpoint
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -425,29 +568,40 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
     if !r.pass {
         return Err(format!("nothing to optimize: verify FAILs at {} — run `cargo djinn implement` first", r.stage));
     }
+    if prev.is_some() && checkpoint_dir(cfg).join("solution").exists() && !same_as_checkpoint(cfg) {
+        eprintln!("note: the solution or proofs differ from the last checkpoint (a cycle cut short, or a manual edit); continuing from the crate as it is — it verifies");
+    }
     checkpoint(cfg)?;
-    // 2. baseline
-    let baseline = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
-    let mut log = OptimizeLog {
-        started: now(),
-        baseline_ns: baseline.median_ns,
-        current_ns: baseline.median_ns,
-        baseline_points: point_list(&baseline),
-        current_points: point_list(&baseline),
-        ..Default::default()
+    // 2. baseline (resuming: the current state, re-measured; the history
+    // keeps the original baseline)
+    let measured = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
+    let mut log = match prev {
+        Some(mut p) => {
+            p.current_ns = measured.median_ns;
+            p.current_points = point_list(&measured);
+            p
+        }
+        None => OptimizeLog {
+            started: now(),
+            baseline_ns: measured.median_ns,
+            current_ns: measured.median_ns,
+            baseline_points: point_list(&measured),
+            current_points: point_list(&measured),
+            ..Default::default()
+        },
     };
     log.save(cfg);
-    let mut current = baseline.clone();
-    eprintln!("baseline: {}", current.line());
+    let mut current = measured;
+    eprintln!("{}: {}", if log.attempts.is_empty() { "baseline" } else { "current (re-measured)" }, current.line());
 
-    let mut cycle = 0usize;
+    let mut api_stop = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             log.interrupted = true;
             break;
         }
         if let Some(n) = opts.cycles {
-            if cycle >= n {
+            if log.cycles_done() >= n {
                 break;
             }
         }
@@ -457,11 +611,8 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
                 break;
             }
         }
-        if opts.cycles.is_none() && opts.agent.limit_usd.is_none() {
-            return Err("give --cycles N and/or --limit USD".into());
-        }
-        cycle += 1;
-        eprintln!("\n== cycle {cycle}{}: current {}", opts.cycles.map(|n| format!(" of {n}")).unwrap_or_default(), fmt_ns(current.median_ns));
+        let cycle = log.next_cycle();
+        eprintln!("\n== cycle {cycle}{}: current {}", opts.cycles.map(|n| format!(" ({} of {n})", log.cycles_done() + 1)).unwrap_or_default(), fmt_ns(current.median_ns));
         let mut agent_opts = Opts {
             agent: opts.agent.agent,
             model: opts.agent.model.clone(),
@@ -498,7 +649,19 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
             attempt.verdict = "interrupted".into();
             log.attempts.push(attempt);
             log.interrupted = true;
+            log.save(cfg);
             revert(cfg, "interrupted")?;
+            break;
+        }
+        // an API error (a usage limit, say): every further cycle would end the
+        // same way. The text stays visible for wrappers that retry on it.
+        if let Some(e) = &run.usage.api_error {
+            eprintln!("cycle {cycle}: the agent stopped on an API error: {e}");
+            attempt.verdict = API_ERROR_VERDICT.into();
+            log.attempts.push(attempt);
+            log.save(cfg);
+            revert(cfg, "the agent stopped on an API error")?;
+            api_stop = true;
             break;
         }
         // (1) it must verify, with the agent's files synced from its jail
@@ -511,22 +674,20 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
             revert(cfg, "verification failed")?;
             continue;
         }
-        // (2) it must be better beyond noise and threshold: faster, or for a
-        // multi-point workload a better trade-off curve
-        let m = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
+        // (2) it must be better beyond noise and threshold: faster, for a
+        // multi-point workload a better trade-off curve, for independent
+        // points faster somewhere and slower nowhere
+        let mut m = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
+        let mut verdict = judge(&current, &m, opts.threshold, size_threshold(&opts), true);
+        if verdict.is_err() && judge(&current, &m, opts.threshold, size_threshold(&opts), false).is_ok() {
+            // better than the threshold, not than the noise: measure again,
+            // longer, instead of rejecting a gain that load blurred
+            eprintln!("cycle {cycle}: borderline ({}) — re-measuring with twice the batches", verdict.as_ref().unwrap_err());
+            m = bench::measure(cfg, opts.min_time * 2.0, opts.batches * 2, opts.jobs, &mut say)?;
+            verdict = judge(&current, &m, opts.threshold, size_threshold(&opts), true);
+        }
         attempt.ns = Some(m.median_ns);
         attempt.points = point_list(&m);
-        let required = opts.threshold.max(current.noise()).max(m.noise());
-        let verdict = if m.is_multi() {
-            frontier_verdict(&current, &m, required, size_threshold(&opts))
-        } else {
-            let improvement = 1.0 - m.median_ns / current.median_ns;
-            if improvement >= required {
-                Ok(improvement)
-            } else {
-                Err(format!("not faster ({:+.1}%, needed {:.1}%)", improvement * 100.0, required * 100.0))
-            }
-        };
         match verdict {
             Ok(improvement) => {
                 attempt.verdict = format!("accepted ({:.1}% better)", improvement * 100.0);
@@ -564,5 +725,134 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
         );
     }
     eprintln!("{}", log.summary_line());
-    Ok(log.accepted > 0)
+    if api_stop {
+        eprintln!("optimize: stopped because the agent hit an API error (see above); run again to resume this history");
+        return Ok(EXIT_API_ERROR);
+    }
+    Ok(if log.accepted > 0 { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    fn attempt(cycle: usize, verdict: &str) -> Attempt {
+        Attempt { cycle, job: String::new(), verdict: verdict.into(), ns: None, points: vec![], summary: String::new(), cost_usd: Some(1.0), cost_is_estimate: false, tokens_in: 0, tokens_out: 0, elapsed_secs: 0 }
+    }
+
+    #[test]
+    fn a_restart_continues_the_history() {
+        let log = OptimizeLog {
+            started: 1,
+            finished: Some(2),
+            baseline_ns: 100.0,
+            current_ns: 80.0,
+            attempts: vec![attempt(1, "accepted (20.0% better)"), attempt(2, "not faster (+1.0%, needed 3.0%)"), attempt(3, API_ERROR_VERDICT)],
+            accepted: 1,
+            spent_usd: 3.0,
+            interrupted: true,
+            ..Default::default()
+        };
+        // through the file, as a restarted run sees it
+        let back: OptimizeLog = serde_json::from_str(&serde_json::to_string(&log).unwrap()).unwrap();
+        let r = back.resumed();
+        assert_eq!((r.finished, r.interrupted), (None, false));
+        assert_eq!((r.baseline_ns, r.accepted, r.spent_usd), (100.0, 1, 3.0));
+        // the API-error cycle does not count toward --cycles; numbering goes on
+        assert_eq!(r.cycles_done(), 2);
+        assert_eq!(r.next_cycle(), 4);
+        assert_eq!(OptimizeLog::default().next_cycle(), 1);
+    }
+
+    #[test]
+    fn a_usage_limit_is_an_api_error() {
+        let dir = std::env::temp_dir().join(format!("djinn-opt-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let log = dir.join("agent.log");
+        fs::write(&log, "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You've hit your limit · resets 3pm\",\"total_cost_usd\":0}\n").unwrap();
+        let u = status::summarize_log(&log, None);
+        assert_eq!(u.api_error.as_deref(), Some("You've hit your limit · resets 3pm"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trees_compare_by_content() {
+        let dir = std::env::temp_dir().join(format!("djinn-opt-tree-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d.join("sub")).unwrap();
+            fs::write(d.join("sub").join("f.rs"), "x").unwrap();
+        }
+        assert!(same_tree(&a, &b));
+        assert!(same_tree(&dir.join("none1"), &dir.join("none2")));
+        fs::write(b.join("sub").join("f.rs"), "y").unwrap();
+        assert!(!same_tree(&a, &b));
+        fs::write(b.join("sub").join("f.rs"), "x").unwrap();
+        fs::write(b.join("g.rs"), "").unwrap();
+        assert!(!same_tree(&a, &b));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+    use crate::bench::Point;
+    /// points (id, size, batch timings)
+    fn m(pts: &[(u64, Option<u64>, &[f64])]) -> Measurement {
+        let points: Vec<Point> = pts
+            .iter()
+            .map(|&(id, size, ns)| {
+                let mut s = ns.to_vec();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                Point { id, ns_per_iter: ns.to_vec(), median_ns: s[s.len() / 2], min_ns: s[0], max_ns: s[s.len() - 1], iters_per_batch: 1, size }
+            })
+            .collect();
+        Measurement { ns_per_iter: vec![], median_ns: points.iter().map(|p| p.median_ns).sum(), min_ns: 0.0, max_ns: 0.0, iters_per_batch: 1, total_secs: 0.0, points }
+    }
+
+    #[test]
+    fn equal_sizes_judge_every_point() {
+        // the frontier of equal sizes is the fastest point alone: a slower
+        // other point must still reject
+        let old = m(&[(1, Some(0), &[10.0; 5]), (2, Some(0), &[100.0; 5])]);
+        let new = m(&[(1, Some(0), &[8.0; 5]), (2, Some(0), &[150.0; 5])]);
+        assert!(old.independent_points());
+        assert!(judge(&old, &new, 0.03, 0.005, true).unwrap_err().contains("slower at point 2"));
+        let new = m(&[(1, None, &[8.0; 5]), (2, None, &[100.5; 5])]);
+        let old = m(&[(1, None, &[10.0; 5]), (2, None, &[100.0; 5])]);
+        assert!((judge(&old, &new, 0.03, 0.005, true).unwrap() - 0.2).abs() < 1e-9);
+        // nothing faster beyond the threshold
+        let new = m(&[(1, None, &[9.9; 5]), (2, None, &[99.0; 5])]);
+        assert!(judge(&old, &new, 0.03, 0.005, true).is_err());
+    }
+
+    #[test]
+    fn one_disturbed_batch_does_not_raise_the_bar() {
+        // a 20% gain; one batch of five slowed 3x by load
+        let old = m(&[(1, None, &[100.0, 101.0, 99.0, 300.0, 100.0])]);
+        let new = m(&[(1, None, &[80.0, 81.0, 79.0, 80.0, 250.0])]);
+        assert!(old.noise() < 0.05, "{}", old.noise());
+        assert!(judge(&old, &new, 0.03, 0.005, true).is_ok());
+        // a plain workload likewise
+        let single = |ns: &[f64]| Measurement { ns_per_iter: ns.to_vec(), median_ns: { let mut s = ns.to_vec(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len() / 2] }, min_ns: 0.0, max_ns: 0.0, iters_per_batch: 1, total_secs: 0.0, points: vec![] };
+        assert!(judge(&single(&[100.0, 101.0, 99.0, 300.0, 100.0]), &single(&[80.0, 81.0, 79.0, 80.0, 250.0]), 0.03, 0.005, true).is_ok());
+    }
+
+    #[test]
+    fn a_borderline_result_is_told_apart() {
+        // 10% faster, but the batches spread 20%: rejected with the noise,
+        // accepted on the threshold alone — so it is re-measured
+        let old = m(&[(1, None, &[100.0; 5])]);
+        let new = m(&[(1, None, &[80.0, 85.0, 90.0, 100.0, 105.0])]);
+        assert!(judge(&old, &new, 0.03, 0.005, true).is_err());
+        assert!(judge(&old, &new, 0.03, 0.005, false).is_ok());
+    }
+
+    #[test]
+    fn sized_points_keep_the_frontier_rule() {
+        let old = m(&[(1, Some(100), &[10.0; 5]), (2, Some(80), &[40.0; 5])]);
+        assert!(!old.independent_points());
+        let new = m(&[(1, Some(100), &[9.0; 5]), (2, Some(80), &[36.0; 5])]);
+        assert!(judge(&old, &new, 0.03, 0.005, true).is_ok());
+    }
 }

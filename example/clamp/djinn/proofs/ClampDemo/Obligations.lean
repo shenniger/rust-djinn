@@ -4,14 +4,17 @@
     Each theorem below is PINNED by its type and takes its proof from
     `ClampDemo.Proofs` by name. The implementer may prove it any way, with any
     helpers, but cannot weaken it: if the type does not match, this file fails
-    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem
-    here against {propext, Classical.choice, Quot.sound}. -/
+    to elaborate. `Audit.lean` then checks every theorem here, outside the
+    reach of `Proofs`: its statement against `Statements.lean`, its proof in
+    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/
 import ClampDemo.Spec
 import ClampDemo.Code.Funs
 import ClampDemo.Proofs
 
 open Aeneas Std
 open ClampDemo.Spec
+
+set_option maxHeartbeats 1000000
 
 namespace ClampDemo.Obligations
 
@@ -21,8 +24,8 @@ namespace ClampDemo.Obligations
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem clamp.unambiguous :
-    ∀ (x : I32) (lo : I32) (hi : I32) (o₁ : I32) (o₂ : I32),
-      clamp_spec x lo hi o₁ → clamp_spec x lo hi o₂ → o₁ = o₂ :=
+    ∀ (x : I32) (lo : I32) (hi : I32) («o₁» : I32) («o₂» : I32),
+      clamp_spec x lo hi «o₁» → clamp_spec x lo hi «o₂» → o₁ = o₂ :=
   ClampDemo.Proofs.clamp.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -50,8 +53,8 @@ theorem clamp.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem count_negative.unambiguous :
-    ∀ (v : List I32) (o₁ : Usize) (o₂ : Usize),
-      count_negative_spec v o₁ → count_negative_spec v o₂ → o₁ = o₂ :=
+    ∀ (v : List I32) («o₁» : Usize) («o₂» : Usize),
+      count_negative_spec v «o₁» → count_negative_spec v «o₂» → o₁ = o₂ :=
   ClampDemo.Proofs.count_negative.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -79,8 +82,8 @@ theorem count_negative.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem min.unambiguous :
-    ∀ (a : I32) (b : I32) (o₁ : I32) (o₂ : I32),
-      min_spec a b o₁ → min_spec a b o₂ → o₁ = o₂ :=
+    ∀ (a : I32) (b : I32) («o₁» : I32) («o₂» : I32),
+      min_spec a b «o₁» → min_spec a b «o₂» → o₁ = o₂ :=
   ClampDemo.Proofs.min.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER
@@ -108,8 +111,8 @@ theorem min.exists :
     equal — the declaration denotes a (partial) function. Ambiguity inherited
     from mentioned rels must be resolved here. -/
 theorem max.unambiguous :
-    ∀ (a : I32) (b : I32) (o₁ : I32) (o₂ : I32),
-      max_spec a b o₁ → max_spec a b o₂ → o₁ = o₂ :=
+    ∀ (a : I32) (b : I32) («o₁» : I32) («o₂» : I32),
+      max_spec a b «o₁» → max_spec a b «o₂» → o₁ = o₂ :=
   ClampDemo.Proofs.max.unambiguous
 
 /-- GUARANTEE: the implementation meets the relation, TERMINATES and NEVER

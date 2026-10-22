@@ -6,7 +6,8 @@
 //! in release mode, calibrates how many iterations take at least
 //! `min_time / batches` seconds, then runs `batches` batches and reports
 //! nanoseconds per iteration. The median is the measurement and the spread
-//! between batches the noise.
+//! between batches (the interquartile range, robust to a batch disturbed by
+//! load) the noise.
 
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
@@ -27,13 +28,27 @@ pub struct Point {
     pub size: Option<u64>,
 }
 
+/// The relative spread of batch timings: the interquartile range over the
+/// median (the full range for fewer than four batches). One batch slowed by
+/// load does not move it, so it does not hide a real gain.
+pub fn spread(ns: &[f64]) -> f64 {
+    let mut v: Vec<f64> = ns.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.len() < 2 {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = v.len();
+    let med = v[n / 2];
+    if med <= 0.0 {
+        return 0.0;
+    }
+    let (lo, hi) = if n < 4 { (v[0], v[n - 1]) } else { (v[n / 4], v[(3 * n) / 4]) };
+    (hi - lo) / med
+}
+
 impl Point {
     pub fn noise(&self) -> f64 {
-        if self.median_ns > 0.0 {
-            (self.max_ns - self.min_ns) / self.median_ns
-        } else {
-            0.0
-        }
+        spread(&self.ns_per_iter)
     }
 }
 
@@ -51,10 +66,14 @@ pub struct Measurement {
 }
 
 impl Measurement {
-    /// Relative spread between the fastest and slowest batch: the worst point's.
+    /// Relative spread between batches (`spread`): the worst point's.
     pub fn noise(&self) -> f64 {
-        let own = if self.median_ns > 0.0 { (self.max_ns - self.min_ns) / self.median_ns } else { 0.0 };
-        self.points.iter().map(|p| p.noise()).fold(own, f64::max)
+        self.points.iter().map(|p| p.noise()).fold(spread(&self.ns_per_iter), f64::max)
+    }
+    /// Several points whose sizes do not trade off against time (all absent
+    /// or all equal): each point is judged on its own.
+    pub fn independent_points(&self) -> bool {
+        self.points.len() > 1 && self.points.windows(2).all(|w| w[0].size == w[1].size)
     }
     /// Several points with sizes: the frontier rule applies.
     pub fn is_multi(&self) -> bool {
@@ -229,6 +248,9 @@ fn main() {{
 
 /// Build the runner in release mode and run it: `jobs` points at a time.
 pub fn measure(cfg: &Config, min_time: f64, batches: usize, jobs: usize, log: &mut dyn FnMut(&str)) -> Result<Measurement, String> {
+    // no batches would make a batch infinitely long (the runner calibrates to
+    // min_time / batches)
+    let batches = batches.max(1);
     let dir = write_runner(cfg)?;
     log("== bench: building the workload runner (release)");
     let out = Command::new("cargo")
@@ -257,7 +279,9 @@ pub fn measure(cfg: &Config, min_time: f64, batches: usize, jobs: usize, log: &m
         return Err(format!("the workload runner failed: {}", String::from_utf8_lossy(&out.stderr)));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let json: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| format!("runner output: {e}: {text}"))?;
+    // the report is the runner's last line: the workload may print too
+    let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let json: serde_json::Value = serde_json::from_str(last.trim()).map_err(|e| format!("runner output: {e}: {text}"))?;
     let mut points = Vec::new();
     for pj in json["points"].as_array().into_iter().flatten() {
         let ns: Vec<f64> = pj["ns_per_iter"].as_array().into_iter().flatten().filter_map(|v| v.as_f64()).collect();

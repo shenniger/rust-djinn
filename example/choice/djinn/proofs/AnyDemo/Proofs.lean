@@ -139,9 +139,9 @@ theorem checked_div.impl_correct :
   · rename_i hb
     subst b
     have hs : alloc.string.String.Insts.CoreConvertFromShared0Str.from
-        (toStr "division by zero") = ok "division by zero" := by
+        (toStr "division by zero" (by rw [show Aeneas.Std.U32.max = 4294967295 by scalar_tac]; decide +kernel)) = ok "division by zero" := by
       unfold alloc.string.String.Insts.CoreConvertFromShared0Str.from
-      have hs : ofBytes (toStr "division by zero").val = some "division by zero" := by
+      have hs : ofBytes (toStr "division by zero" (by rw [show Aeneas.Std.U32.max = 4294967295 by scalar_tac]; decide +kernel)).val = some "division by zero" := by
         decide +kernel
       rw [hs]
     rw [hs]

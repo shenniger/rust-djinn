@@ -188,4 +188,65 @@ theorem memrchr_eq_some {n : U8} {l : List U8} {i : Nat} :
       rw [getElem!_pos l _ (by omega)] at hj
       simpa using hj
 
+/-- `v.extend_from_slice(s)`: Aeneas models it but states no `step` lemma.
+    With a clone that is the identity on `s` (every scalar's), the result is
+    `v ++ s`, and it does not panic while the length fits. Not a global
+    `@[step]` lemma (proofs that state their own would see two): use
+    `step with Djinn.Vocab.extend_from_slice_spec` or
+    `attribute [local step] Djinn.Vocab.extend_from_slice_spec`. -/
+theorem extend_from_slice_spec {T : Type} (cloneInst : core.clone.Clone T) (v : alloc.vec.Vec T) (s : Aeneas.Std.Slice T)
+    (hc : ∀ x ∈ s.val, cloneInst.clone x = ok x) (h : v.length + s.length ≤ Usize.max) :
+    alloc.vec.Vec.extend_from_slice cloneInst v s ⦃ r => r.val = v.val ++ s.val ⦄ := by
+  have hcl := Slice.clone_spec (clone := cloneInst.clone) hc
+  rw [WP.spec_equiv_exists] at hcl
+  obtain ⟨s', hs', hss⟩ := hcl
+  subst hss
+  unfold alloc.vec.Vec.extend_from_slice
+  rw [dif_pos h]
+  split
+  · rename_i s'' h'
+    simp [hs'] at h'
+    subst h'
+    simp
+  · rename_i h'
+    simp [hs'] at h'
+  · rename_i h'
+    simp [hs'] at h'
+
+/-- `slice.sort()`'s model: an insertion sort with Rust's `Ord::cmp`.
+    `insertM` puts `x` before the first element it is not greater than;
+    `sortM` inserts each element into the sorted rest of the list, so an
+    element ends up before the equal ones after it: the sort is stable. -/
+def insertM {T : Type} (cmp : T → T → Result Ordering) (x : T) : List T → Result (List T)
+  | [] => ok [x]
+  | y :: ys => do
+    let o ← cmp x y
+    if o ≠ .gt then ok (x :: y :: ys) else do
+      let r ← insertM cmp x ys
+      ok (y :: r)
+
+def sortM {T : Type} (cmp : T → T → Result Ordering) : List T → Result (List T)
+  | [] => ok []
+  | x :: xs => do
+    let s ← sortM cmp xs
+    insertM cmp x s
+
+/-- With a comparison that never fails, the model is Mathlib's insertion sort
+    by "not greater": sorted (`List.sorted_insertionSort`) and a permutation
+    (`List.perm_insertionSort`). -/
+theorem sortM_ok {T : Type} (f : T → T → Ordering) (l : List T) :
+    sortM (fun a b => ok (f a b)) l = ok (l.insertionSort (fun a b => f a b ≠ .gt)) := by
+  have hins : ∀ (x : T) (m : List T), insertM (fun a b => ok (f a b)) x m = ok (m.orderedInsert (fun a b => f a b ≠ .gt) x) := by
+    intro x m
+    induction m with
+    | nil => rw [insertM, List.orderedInsert_nil]
+    | cons y ys ih =>
+      rw [insertM, List.orderedInsert_cons]
+      by_cases h : f x y ≠ .gt
+      · simp [h]
+      · simp [h, ih]
+  induction l with
+  | nil => rw [sortM, List.insertionSort_nil]
+  | cons x xs ih => rw [sortM, List.insertionSort_cons, ih]; simp [hins]
+
 end Djinn.Vocab

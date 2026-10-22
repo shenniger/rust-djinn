@@ -308,11 +308,16 @@ fn status_views(cfg: &Config, path: &Path, text: &str) -> HashMap<String, (Strin
     let report = verify::Report::load(cfg);
     let (texts, _) = spec_texts_with(cfg, path, text);
     let views = status::views_text(cfg, report.as_ref(), None, &texts);
+    // the files on disk against the report's fingerprint, as the build gate
+    // checks them: a mismatch makes every verdict of the report stale
+    let stale = report.as_ref().and_then(|r| status::evidence_check(cfg, r).message());
     let mut m = HashMap::new();
     for v in views {
         let proved = v.obs.iter().filter(|(_, s)| *s == ObState::Verified).count();
         let short = if v.changed {
             "changed since verification".to_string()
+        } else if let Some(why) = &stale {
+            why.clone()
         } else if v.kind == "rel" {
             // a rel has no implementation: only proof obligations, if any
             if v.obs.is_empty() {
@@ -697,14 +702,17 @@ fn run_driver(ctx: &Ctx, bin: &Path, manifest: &Path, is_impl: bool, agent: &str
     }
     let status = child.wait().ok();
     let last_out = out_thread.join().unwrap_or_default();
-    let ok = status.map(|s| s.success()).unwrap_or(false);
+    // exit 3: every obligation proved while some `fn` has no implementation
+    // (spec only): named from the report as verify prints it, like a PASS
+    let ok = status.map(|s| s.success() || s.code() == Some(3)).unwrap_or(false);
+    let verdict = if ok { load_config(manifest).ok().and_then(|cfg| verify::Report::load(&cfg)).map(|r| status::verdict(&r)).unwrap_or_else(|| "PASS".into()) } else { "FAIL".into() };
     ctx.notify::<notification::Progress>(ProgressParams {
         token: token.clone(),
-        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd { message: Some(if ok { "PASS".into() } else { "FAIL".into() }) })),
+        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd { message: Some(verdict.clone()) })),
     });
     let _ = last_out;
     // one line for the message area; the details are in the log
     let fail_line = last_lines.iter().rev().find(|l| l.starts_with("FAIL")).cloned().unwrap_or_else(|| last_lines.last().cloned().unwrap_or_default());
-    ctx.show(if ok { MessageType::INFO } else { MessageType::WARNING }, format!("{title}: {}", if ok { "PASS — every obligation verified".to_string() } else { fail_line }));
+    ctx.show(if ok { MessageType::INFO } else { MessageType::WARNING }, format!("{title}: {}", if verdict == "PASS" { "PASS — every obligation verified".to_string() } else if ok { verdict } else { fail_line }));
     ctx.refresh();
 }

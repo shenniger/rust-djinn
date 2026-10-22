@@ -12,6 +12,9 @@ open Aeneas Std Result
 set_option linter.unusedSimpArgs false
 set_option linter.unusedVariables false
 set_option linter.unusedTactic false
+set_option maxHeartbeats 1000000
+
+open scoped Classical
 
 namespace Gzip.Spec
 
@@ -23,7 +26,7 @@ def bit_pre (s : List U8) (i : ℤ) : Prop :=
 def bit_spec (s : List U8) (i : ℤ) (b : ℤ) : Prop :=
   bit_pre s i ∧
   (0 ≤ i ∧ i < (8 * (s.length : ℤ))) ∧
-  b = ((((s[(i / 8).toNat]!).val : ℤ) / (2 ^ ((i % 8)).toNat)) % 2)
+  b = ((((s[((i / 8) : ℤ).toNat]!).val : ℤ) / (2 ^ ((i % 8) : ℤ).toNat)) % 2)
 
 /-! ## rel field -/
 
@@ -34,8 +37,8 @@ def field_spec (s : List U8) (i : ℤ) (n : ℤ) (v : ℤ) : Prop :=
   field_pre s i n ∧
   ((0 ≤ n) →
   ((n = 0 → v = 0) ∧ (¬(n = 0) → (∃ v_call0 : ℤ, bit_spec s i v_call0 ∧ (bit_spec s i v_call0 → (∃ v_call1 : ℤ, field_spec s (i + 1) (n - 1) v_call1 ∧ v = (v_call0 + (2 * v_call1))))))))
-termination_by (n).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+termination_by (n : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel code -/
 
@@ -46,8 +49,8 @@ def code_spec (s : List U8) (i : ℤ) (n : ℤ) (v : ℤ) : Prop :=
   code_pre s i n ∧
   ((0 ≤ n) →
   ((n = 0 → v = 0) ∧ (¬(n = 0) → (∃ v_call0 : ℤ, code_spec s i (n - 1) v_call0 ∧ (∃ v_call1 : ℤ, bit_spec s ((i + n) - 1) v_call1 ∧ v = ((2 * v_call0) + v_call1))))))
-termination_by (n).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+termination_by (n : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel u16le -/
 
@@ -57,7 +60,7 @@ def u16le_pre (s : List U8) (i : ℤ) : Prop :=
 def u16le_spec (s : List U8) (i : ℤ) (v : ℤ) : Prop :=
   u16le_pre s i ∧
   (0 ≤ i ∧ (i + 2) ≤ (s.length : ℤ)) ∧
-  v = (((s[i.toNat]!).val : ℤ) + (256 * ((s[(i + 1).toNat]!).val : ℤ)))
+  v = (((s[i.toNat]!).val : ℤ) + (256 * ((s[((i + 1) : ℤ).toNat]!).val : ℤ)))
 
 /-! ## rel u32le -/
 
@@ -76,9 +79,9 @@ def shorter_pre (lens : List U8) (k : ℤ) (n : ℤ) : Prop :=
 def shorter_spec (lens : List U8) (k : ℤ) (n : ℤ) (c : ℤ) : Prop :=
   shorter_pre lens k n ∧
   (((0 ≤ k ∧ k ≤ (lens.length : ℤ))) →
-  ((k = 0 → c = 0) ∧ (¬(k = 0) → (((1 ≤ ((lens[(k - 1).toNat]!).val : ℤ) ∧ ((lens[(k - 1).toNat]!).val : ℤ) < n) → (∃ v_call0 : ℤ, shorter_spec lens (k - 1) n v_call0 ∧ c = (v_call0 + (2 ^ ((n - ((lens[(k - 1).toNat]!).val : ℤ))).toNat)))) ∧ (¬((1 ≤ ((lens[(k - 1).toNat]!).val : ℤ) ∧ ((lens[(k - 1).toNat]!).val : ℤ) < n)) → shorter_spec lens (k - 1) n c)))))
-termination_by (k).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  ((k = 0 → c = 0) ∧ (¬(k = 0) → (((1 ≤ ((lens[((k - 1) : ℤ).toNat]!).val : ℤ) ∧ ((lens[((k - 1) : ℤ).toNat]!).val : ℤ) < n) → (∃ v_call0 : ℤ, shorter_spec lens (k - 1) n v_call0 ∧ c = (v_call0 + (2 ^ ((n - ((lens[((k - 1) : ℤ).toNat]!).val : ℤ)) : ℤ).toNat)))) ∧ (¬((1 ≤ ((lens[((k - 1) : ℤ).toNat]!).val : ℤ) ∧ ((lens[((k - 1) : ℤ).toNat]!).val : ℤ) < n)) → shorter_spec lens (k - 1) n c)))))
+termination_by (k : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel earlier -/
 
@@ -88,9 +91,9 @@ def earlier_pre (lens : List U8) (k : ℤ) (n : ℤ) : Prop :=
 def earlier_spec (lens : List U8) (k : ℤ) (n : ℤ) (c : ℤ) : Prop :=
   earlier_pre lens k n ∧
   (((0 ≤ k ∧ k ≤ (lens.length : ℤ))) →
-  ((k = 0 → c = 0) ∧ (¬(k = 0) → ((((lens[(k - 1).toNat]!).val : ℤ) = n → (∃ v_call0 : ℤ, earlier_spec lens (k - 1) n v_call0 ∧ c = (v_call0 + 1))) ∧ (¬(((lens[(k - 1).toNat]!).val : ℤ) = n) → earlier_spec lens (k - 1) n c)))))
-termination_by (k).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  ((k = 0 → c = 0) ∧ (¬(k = 0) → ((((lens[((k - 1) : ℤ).toNat]!).val : ℤ) = n → (∃ v_call0 : ℤ, earlier_spec lens (k - 1) n v_call0 ∧ c = (v_call0 + 1))) ∧ (¬(((lens[((k - 1) : ℤ).toNat]!).val : ℤ) = n) → earlier_spec lens (k - 1) n c)))))
+termination_by (k : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel codeword -/
 
@@ -109,7 +112,7 @@ def valid_pre (lens : List U8) (n : ℤ) : Prop :=
 
 def valid_spec (lens : List U8) (n : ℤ) (b : Bool) : Prop :=
   valid_pre lens n ∧
-  (b = true ↔ ((∀ l, l ∈ lens → (l.val : ℤ) ≤ n) ∧ (∃ v_call0 : ℤ, shorter_spec lens (lens.length : ℤ) (n + 1) v_call0 ∧ v_call0 ≤ (2 ^ ((n + 1)).toNat))))
+  (b = true ↔ ((∀ l, l ∈ lens → (l.val : ℤ) ≤ n) ∧ (∃ v_call0 : ℤ, shorter_spec lens (lens.length : ℤ) (n + 1) v_call0 ∧ v_call0 ≤ (2 ^ ((n + 1) : ℤ).toNat))))
 
 /-! ## rel symbol -/
 
@@ -129,7 +132,7 @@ def fixedlen_pre (sym : ℤ) : Prop :=
 
 def fixedlen_spec (sym : ℤ) (n : ℤ) : Prop :=
   fixedlen_pre sym ∧
-  n = (if sym < 144 then 8 else (if sym < 256 then 9 else (if sym < 280 then 7 else 8)))
+  n = (if sym < 144 then 8 else (if sym < 256 then 9 else (if sym < 280 then 7 else 8 : ℤ) : ℤ) : ℤ)
 
 /-! ## rel fixedlit -/
 
@@ -169,10 +172,9 @@ def lbase_pre (k : ℤ) : Prop :=
 def lbase_spec (k : ℤ) (b : ℤ) : Prop :=
   lbase_pre k ∧
   ((0 ≤ k) →
-  k ≤ 28 ∧
-  ((k = 0 → b = 3) ∧ (¬(k = 0) → ((k = 28 → b = 258) ∧ (¬(k = 28) → (∃ v_call0 : ℤ, lbase_spec (k - 1) v_call0 ∧ (∃ v_call1 : ℤ, lextra_spec (k - 1) v_call1 ∧ b = (v_call0 + (2 ^ (v_call1).toNat)))))))))
-termination_by (k).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  (k ≤ 28 ∧ (k ≤ 28 → ((k = 0 → b = 3) ∧ (¬(k = 0) → ((k = 28 → b = 258) ∧ (¬(k = 28) → (∃ v_call0 : ℤ, lbase_spec (k - 1) v_call0 ∧ (∃ v_call1 : ℤ, lextra_spec (k - 1) v_call1 ∧ b = (v_call0 + (2 ^ v_call1.toNat)))))))))))
+termination_by (k : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel dextra -/
 
@@ -192,10 +194,9 @@ def dbase_pre (k : ℤ) : Prop :=
 def dbase_spec (k : ℤ) (b : ℤ) : Prop :=
   dbase_pre k ∧
   ((0 ≤ k) →
-  k ≤ 29 ∧
-  ((k = 0 → b = 1) ∧ (¬(k = 0) → (∃ v_call0 : ℤ, dbase_spec (k - 1) v_call0 ∧ (∃ v_call1 : ℤ, dextra_spec (k - 1) v_call1 ∧ b = (v_call0 + (2 ^ (v_call1).toNat)))))))
-termination_by (k).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  (k ≤ 29 ∧ (k ≤ 29 → ((k = 0 → b = 1) ∧ (¬(k = 0) → (∃ v_call0 : ℤ, dbase_spec (k - 1) v_call0 ∧ (∃ v_call1 : ℤ, dextra_spec (k - 1) v_call1 ∧ b = (v_call0 + (2 ^ v_call1.toNat)))))))))
+termination_by (k : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel append -/
 
@@ -205,8 +206,8 @@ def append_pre (prev : List U8) (x : ℤ) : Prop :=
 def append_spec (prev : List U8) (x : ℤ) (out : List U8) : Prop :=
   append_pre prev x ∧
   (out.length : ℤ) = ((prev.length : ℤ) + 1) ∧
-  ((out.drop 0).take ((prev.length : ℤ)).toNat) = prev ∧
-  ((out[(prev.length : ℤ).toNat]!).val : ℤ) = x
+  ((out.drop 0).take ((prev.length : ℤ) : ℤ).toNat) = prev ∧
+  ((out[((prev.length : ℤ) : ℤ).toNat]!).val : ℤ) = x
 
 /-! ## rel copy -/
 
@@ -217,8 +218,8 @@ def copy_spec (prev : List U8) (d : ℤ) (len : ℤ) (out : List U8) : Prop :=
   copy_pre prev d len ∧
   (1 ≤ d ∧ d ≤ (prev.length : ℤ)) ∧
   (out.length : ℤ) = ((prev.length : ℤ) + len) ∧
-  ((out.drop 0).take ((prev.length : ℤ)).toNat) = prev ∧
-  (∀ k : ℤ, (prev.length : ℤ) ≤ k → k < (out.length : ℤ) → out[k.toNat]! = out[(k - d).toNat]!)
+  ((out.drop 0).take ((prev.length : ℤ) : ℤ).toNat) = prev ∧
+  (∀ k : ℤ, (prev.length : ℤ) ≤ k → k < (out.length : ℤ) → out[k.toNat]! = out[((k - d) : ℤ).toNat]!)
 
 /-! ## rel symbols -/
 
@@ -229,8 +230,8 @@ def symbols_spec (s : List U8) (i : ℤ) (lit : List U8) (dist : List U8) (prev 
   symbols_pre s i lit dist prev out ∧
   (True →
   (∃ (sym : ℤ) (a : ℤ), (symbol_spec s i lit sym ∧ (symbol_spec s i lit sym → (a = (i + ((lit[sym.toNat]!).val : ℤ)) ∧ (a = (i + ((lit[sym.toNat]!).val : ℤ)) → ((i < a ∧ a ≤ (8 * (s.length : ℤ))) ∧ ((i < a ∧ a ≤ (8 * (s.length : ℤ))) → ((sym = 256 → (out = prev ∧ j = a)) ∧ (¬(sym = 256) → ((sym < 256 → (∃ v_call19 : List U8, append_spec prev sym v_call19 ∧ (append_spec prev sym v_call19 → symbols_spec s a lit dist v_call19 out j))) ∧ (¬(sym < 256) → (∃ (len : ℤ) (b : ℤ) (dc : ℤ) (d : ℤ) (c : ℤ), ((∃ v_call29 : ℤ, lbase_spec (sym - 257) v_call29 ∧ (∃ v_call30 : ℤ, lextra_spec (sym - 257) v_call30 ∧ (∃ v_call31 : ℤ, field_spec s a v_call30 v_call31 ∧ len = (v_call29 + v_call31)))) ∧ ((∃ v_call29 : ℤ, lbase_spec (sym - 257) v_call29 ∧ (∃ v_call30 : ℤ, lextra_spec (sym - 257) v_call30 ∧ (∃ v_call31 : ℤ, field_spec s a v_call30 v_call31 ∧ len = (v_call29 + v_call31)))) → ((∃ v_call32 : ℤ, lextra_spec (sym - 257) v_call32 ∧ b = (a + v_call32)) ∧ ((∃ v_call32 : ℤ, lextra_spec (sym - 257) v_call32 ∧ b = (a + v_call32)) → (symbol_spec s b dist dc ∧ (symbol_spec s b dist dc → ((∃ v_call33 : ℤ, dbase_spec dc v_call33 ∧ (∃ v_call34 : ℤ, dextra_spec dc v_call34 ∧ (∃ v_call35 : ℤ, field_spec s (b + ((dist[dc.toNat]!).val : ℤ)) v_call34 v_call35 ∧ d = (v_call33 + v_call35)))) ∧ ((∃ v_call33 : ℤ, dbase_spec dc v_call33 ∧ (∃ v_call34 : ℤ, dextra_spec dc v_call34 ∧ (∃ v_call35 : ℤ, field_spec s (b + ((dist[dc.toNat]!).val : ℤ)) v_call34 v_call35 ∧ d = (v_call33 + v_call35)))) → ((∃ v_call36 : ℤ, dextra_spec dc v_call36 ∧ c = ((b + ((dist[dc.toNat]!).val : ℤ)) + v_call36)) ∧ ((∃ v_call36 : ℤ, dextra_spec dc v_call36 ∧ c = ((b + ((dist[dc.toNat]!).val : ℤ)) + v_call36)) → ((a < c ∧ c ≤ (8 * (s.length : ℤ))) ∧ ((a < c ∧ c ≤ (8 * (s.length : ℤ))) → (∃ v_call37 : List U8, copy_spec prev d len v_call37 ∧ (copy_spec prev d len v_call37 → symbols_spec s c lit dist v_call37 out j)))))))))))))))))))))))))))
-termination_by (((8 * (s.length : ℤ)) - i)).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+termination_by (((8 * (s.length : ℤ)) - i) : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel stored -/
 
@@ -239,7 +240,7 @@ def stored_pre (s : List U8) (i : ℤ) (prev : List U8) (out : List U8) : Prop :
 
 def stored_spec (s : List U8) (i : ℤ) (prev : List U8) (out : List U8) (j : ℤ) : Prop :=
   stored_pre s i prev out ∧
-  (∃ (a : ℤ) (len : ℤ), (a = ((i + 7) / 8) ∧ u16le_spec s a len ∧ u16le_spec s (a + 2) (65535 - len) ∧ ((a + 4) + len) ≤ (s.length : ℤ) ∧ (out.length : ℤ) = ((prev.length : ℤ) + len) ∧ ((out.drop 0).take ((prev.length : ℤ)).toNat) = prev ∧ ((out.drop ((prev.length : ℤ)).toNat).take ((out.length : ℤ) - (prev.length : ℤ)).toNat) = ((s.drop ((a + 4)).toNat).take (((a + 4) + len) - (a + 4)).toNat) ∧ j = (8 * ((a + 4) + len))))
+  (∃ (a : ℤ) (len : ℤ), (a = ((i + 7) / 8) ∧ u16le_spec s a len ∧ u16le_spec s (a + 2) (65535 - len) ∧ ((a + 4) + len) ≤ (s.length : ℤ) ∧ (out.length : ℤ) = ((prev.length : ℤ) + len) ∧ ((out.drop 0).take ((prev.length : ℤ) : ℤ).toNat) = prev ∧ ((out.drop ((prev.length : ℤ) : ℤ).toNat).take ((out.length : ℤ) - (prev.length : ℤ) : ℤ).toNat) = ((s.drop ((a + 4) : ℤ).toNat).take (((a + 4) + len) - (a + 4) : ℤ).toNat) ∧ j = (8 * ((a + 4) + len))))
 
 /-! ## rel lengths -/
 
@@ -249,9 +250,9 @@ def lengths_pre (s : List U8) (i : ℤ) (cl : List U8) (p : ℤ) (all : List U8)
 def lengths_spec (s : List U8) (i : ℤ) (cl : List U8) (p : ℤ) (all : List U8) (j : ℤ) : Prop :=
   lengths_pre s i cl p all ∧
   (((0 ≤ p ∧ p ≤ (all.length : ℤ))) →
-  ((p = (all.length : ℤ) → j = i) ∧ (¬(p = (all.length : ℤ)) → (∃ (sym : ℤ) (a : ℤ) (n : ℤ), (symbol_spec s i cl sym ∧ (symbol_spec s i cl sym → (a = (i + ((cl[sym.toNat]!).val : ℤ)) ∧ (a = (i + ((cl[sym.toNat]!).val : ℤ)) → ((sym < 16 → (n = 1 ∧ (n = 1 → ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = sym) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = sym) → lengths_spec s a cl (p + n) all j))))) ∧ (¬(sym < 16) → ((sym = 16 → (1 ≤ p ∧ (1 ≤ p → ((∃ v_call3 : ℤ, field_spec s a 2 v_call3 ∧ n = (3 + v_call3)) ∧ ((∃ v_call3 : ℤ, field_spec s a 2 v_call3 ∧ n = (3 + v_call3)) → ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) ∧ ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) → ((∀ k : ℤ, p ≤ k → k < (p + n) → all[k.toNat]! = all[(p - 1).toNat]!) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → all[k.toNat]! = all[(p - 1).toNat]!) → lengths_spec s (a + 2) cl (p + n) all j))))))))) ∧ (¬(sym = 16) → ((sym = 17 → ((∃ v_call4 : ℤ, field_spec s a 3 v_call4 ∧ n = (3 + v_call4)) ∧ ((∃ v_call4 : ℤ, field_spec s a 3 v_call4 ∧ n = (3 + v_call4)) → ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) ∧ ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) → ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) → lengths_spec s (a + 3) cl (p + n) all j))))))) ∧ (¬(sym = 17) → (sym = 18 ∧ (sym = 18 → ((∃ v_call5 : ℤ, field_spec s a 7 v_call5 ∧ n = (11 + v_call5)) ∧ ((∃ v_call5 : ℤ, field_spec s a 7 v_call5 ∧ n = (11 + v_call5)) → ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) ∧ ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) → ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) → lengths_spec s (a + 7) cl (p + n) all j))))))))))))))))))))))
-termination_by (((all.length : ℤ) - p)).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  ((p = (all.length : ℤ) → j = i) ∧ (¬(p = (all.length : ℤ)) → (∃ (sym : ℤ) (a : ℤ) (n : ℤ), (symbol_spec s i cl sym ∧ (symbol_spec s i cl sym → (a = (i + ((cl[sym.toNat]!).val : ℤ)) ∧ (a = (i + ((cl[sym.toNat]!).val : ℤ)) → ((sym < 16 → (n = 1 ∧ (n = 1 → ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = sym) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = sym) → lengths_spec s a cl (p + n) all j))))) ∧ (¬(sym < 16) → ((sym = 16 → (1 ≤ p ∧ (1 ≤ p → ((∃ v_call3 : ℤ, field_spec s a 2 v_call3 ∧ n = (3 + v_call3)) ∧ ((∃ v_call3 : ℤ, field_spec s a 2 v_call3 ∧ n = (3 + v_call3)) → ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) ∧ ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) → ((∀ k : ℤ, p ≤ k → k < (p + n) → all[k.toNat]! = all[((p - 1) : ℤ).toNat]!) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → all[k.toNat]! = all[((p - 1) : ℤ).toNat]!) → lengths_spec s (a + 2) cl (p + n) all j))))))))) ∧ (¬(sym = 16) → ((sym = 17 → ((∃ v_call4 : ℤ, field_spec s a 3 v_call4 ∧ n = (3 + v_call4)) ∧ ((∃ v_call4 : ℤ, field_spec s a 3 v_call4 ∧ n = (3 + v_call4)) → ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) ∧ ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) → ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) → lengths_spec s (a + 3) cl (p + n) all j))))))) ∧ (¬(sym = 17) → (sym = 18 ∧ (sym = 18 → ((∃ v_call5 : ℤ, field_spec s a 7 v_call5 ∧ n = (11 + v_call5)) ∧ ((∃ v_call5 : ℤ, field_spec s a 7 v_call5 ∧ n = (11 + v_call5)) → ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) ∧ ((p < (p + n) ∧ (p + n) ≤ (all.length : ℤ)) → ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) ∧ ((∀ k : ℤ, p ≤ k → k < (p + n) → ((all[k.toNat]!).val : ℤ) = 0) → lengths_spec s (a + 7) cl (p + n) all j))))))))))))))))))))))
+termination_by (((all.length : ℤ) - p) : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel tables -/
 
@@ -260,7 +261,7 @@ def tables_pre (s : List U8) (i : ℤ) (lit : List U8) (dist : List U8) : Prop :
 
 def tables_spec (s : List U8) (i : ℤ) (lit : List U8) (dist : List U8) (j : ℤ) : Prop :=
   tables_pre s i lit dist ∧
-  (∃ (hclen : ℤ) (cl : List U8) (all : List U8), ((∃ v_call4 : ℤ, field_spec s i 5 v_call4 ∧ (lit.length : ℤ) = (257 + v_call4)) ∧ (∃ v_call5 : ℤ, field_spec s (i + 5) 5 v_call5 ∧ (dist.length : ℤ) = (1 + v_call5)) ∧ (∃ v_call6 : ℤ, field_spec s (i + 10) 4 v_call6 ∧ hclen = (4 + v_call6)) ∧ (cl.length : ℤ) = 19 ∧ (∀ k : ℤ, 0 ≤ k → k < 19 → ((k < hclen → (∃ v_out7 : ℤ, field_spec s ((i + 14) + (3 * k)) 3 v_out7 ∧ v_out7 = ((cl[([16#u8, 17#u8, 18#u8, 0#u8, 8#u8, 7#u8, 9#u8, 6#u8, 10#u8, 5#u8, 11#u8, 4#u8, 12#u8, 3#u8, 13#u8, 2#u8, 14#u8, 1#u8, 15#u8][k.toNat]!).val]!).val : ℤ))) ∧ (¬(k < hclen) → ((cl[([16#u8, 17#u8, 18#u8, 0#u8, 8#u8, 7#u8, 9#u8, 6#u8, 10#u8, 5#u8, 11#u8, 4#u8, 12#u8, 3#u8, 13#u8, 2#u8, 14#u8, 1#u8, 15#u8][k.toNat]!).val]!).val : ℤ) = 0))) ∧ valid_spec cl 7 true ∧ (all.length : ℤ) = ((lit.length : ℤ) + (dist.length : ℤ)) ∧ ((all.drop 0).take ((lit.length : ℤ)).toNat) = lit ∧ ((all.drop ((lit.length : ℤ)).toNat).take ((all.length : ℤ) - (lit.length : ℤ)).toNat) = dist ∧ lengths_spec s ((i + 14) + (3 * hclen)) cl 0 all j ∧ valid_spec lit 15 true ∧ valid_spec dist 15 true))
+  (∃ (hclen : ℤ) (cl : List U8) (all : List U8), ((∃ v_call4 : ℤ, field_spec s i 5 v_call4 ∧ (lit.length : ℤ) = (257 + v_call4)) ∧ (∃ v_call5 : ℤ, field_spec s (i + 5) 5 v_call5 ∧ (dist.length : ℤ) = (1 + v_call5)) ∧ (∃ v_call6 : ℤ, field_spec s (i + 10) 4 v_call6 ∧ hclen = (4 + v_call6)) ∧ (cl.length : ℤ) = 19 ∧ (∀ k : ℤ, 0 ≤ k → k < 19 → ((k < hclen → (∃ v_out7 : ℤ, field_spec s ((i + 14) + (3 * k)) 3 v_out7 ∧ v_out7 = ((cl[([16#u8, 17#u8, 18#u8, 0#u8, 8#u8, 7#u8, 9#u8, 6#u8, 10#u8, 5#u8, 11#u8, 4#u8, 12#u8, 3#u8, 13#u8, 2#u8, 14#u8, 1#u8, 15#u8][k.toNat]!).val]!).val : ℤ))) ∧ (¬(k < hclen) → ((cl[([16#u8, 17#u8, 18#u8, 0#u8, 8#u8, 7#u8, 9#u8, 6#u8, 10#u8, 5#u8, 11#u8, 4#u8, 12#u8, 3#u8, 13#u8, 2#u8, 14#u8, 1#u8, 15#u8][k.toNat]!).val]!).val : ℤ) = 0))) ∧ valid_spec cl 7 true ∧ (all.length : ℤ) = ((lit.length : ℤ) + (dist.length : ℤ)) ∧ ((all.drop 0).take ((lit.length : ℤ) : ℤ).toNat) = lit ∧ ((all.drop ((lit.length : ℤ) : ℤ).toNat).take ((all.length : ℤ) - (lit.length : ℤ) : ℤ).toNat) = dist ∧ lengths_spec s ((i + 14) + (3 * hclen)) cl 0 all j ∧ valid_spec lit 15 true ∧ valid_spec dist 15 true))
 
 /-! ## rel block -/
 
@@ -280,8 +281,8 @@ def blocks_spec (s : List U8) (i : ℤ) (prev : List U8) (out : List U8) (j : �
   blocks_pre s i prev out ∧
   (True →
   ((bit_spec s i 0 → (∃ (mid : List U8) (k : ℤ), (block_spec s (i + 1) prev mid k ∧ (block_spec s (i + 1) prev mid k → ((i < k ∧ k ≤ (8 * (s.length : ℤ))) ∧ ((i < k ∧ k ≤ (8 * (s.length : ℤ))) → blocks_spec s k mid out j)))))) ∧ (¬(bit_spec s i 0) → block_spec s (i + 1) prev out j)))
-termination_by (((8 * (s.length : ℤ)) - i)).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+termination_by (((8 * (s.length : ℤ)) - i) : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel xor -/
 
@@ -292,8 +293,8 @@ def xor_spec (a : ℤ) (b : ℤ) (c : ℤ) : Prop :=
   xor_pre a b ∧
   (((0 ≤ a ∧ 0 ≤ b)) →
   (((a = 0 ∧ b = 0) → c = 0) ∧ (¬((a = 0 ∧ b = 0)) → (∃ v_call0 : ℤ, xor_spec (a / 2) (b / 2) v_call0 ∧ c = (((a + b) % 2) + (2 * v_call0))))))
-termination_by ((a + b)).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre, xor_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+termination_by ((a + b) : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre, xor_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel crcbit -/
 
@@ -313,8 +314,8 @@ def crcbits_spec (c : ℤ) (n : ℤ) (d : ℤ) : Prop :=
   crcbits_pre c n ∧
   (((0 ≤ c ∧ 0 ≤ n)) →
   ((n = 0 → d = c) ∧ (¬(n = 0) → (∃ v_call0 : ℤ, crcbits_spec c (n - 1) v_call0 ∧ crcbit_spec v_call0 d))))
-termination_by (n).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre, xor_pre, crcbit_pre, crcbit_spec, crcbits_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+termination_by (n : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre, xor_pre, crcbit_pre, crcbit_spec, crcbits_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## rel crcreg -/
 
@@ -324,9 +325,9 @@ def crcreg_pre (data : List U8) (n : ℤ) : Prop :=
 def crcreg_spec (data : List U8) (n : ℤ) (c : ℤ) : Prop :=
   crcreg_pre data n ∧
   (((0 ≤ n ∧ n ≤ (data.length : ℤ))) →
-  ((n = 0 → c = 4294967295) ∧ (¬(n = 0) → (∃ v_call0 : ℤ, crcreg_spec data (n - 1) v_call0 ∧ (∃ v_call1 : ℤ, xor_spec v_call0 ((data[(n - 1).toNat]!).val : ℤ) v_call1 ∧ crcbits_spec v_call1 8 c)))))
-termination_by (n).toNat
-decreasing_by all_goals (simp_wf; first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre, xor_pre, crcbit_pre, crcbit_spec, crcbits_pre, crcreg_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
+  ((n = 0 → c = 4294967295) ∧ (¬(n = 0) → (∃ v_call0 : ℤ, crcreg_spec data (n - 1) v_call0 ∧ (∃ v_call1 : ℤ, xor_spec v_call0 ((data[((n - 1) : ℤ).toNat]!).val : ℤ) v_call1 ∧ crcbits_spec v_call1 8 c)))))
+termination_by (n : ℤ).toNat
+decreasing_by all_goals (simp_wf; (try simp only [List.getElem!_eq_getElem?_getD] at *); first | ((try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega) | ( (try simp only [bit_pre, bit_spec, field_pre, code_pre, u16le_pre, u16le_spec, u32le_pre, u32le_spec, shorter_pre, earlier_pre, codeword_pre, codeword_spec, valid_pre, valid_spec, symbol_pre, symbol_spec, fixedlen_pre, fixedlen_spec, fixedlit_pre, fixedlit_spec, fixeddist_pre, fixeddist_spec, lextra_pre, lextra_spec, lbase_pre, dextra_pre, dextra_spec, dbase_pre, append_pre, append_spec, copy_pre, copy_spec, symbols_pre, stored_pre, stored_spec, lengths_pre, tables_pre, tables_spec, block_pre, block_spec, blocks_pre, xor_pre, crcbit_pre, crcbit_spec, crcbits_pre, crcreg_pre] at *); (try simp only [List.length_take, List.length_drop, List.length_append, List.length_cons, List.length_nil, List.length_map, List.length_reverse, eq_self_iff_true, true_iff, iff_true, true_and, and_true] at *); omega))
 
 /-! ## func crc32 -/
 
@@ -344,7 +345,7 @@ def flag_pre (f : ℤ) (k : ℤ) : Prop :=
 
 def flag_spec (f : ℤ) (k : ℤ) (b : Bool) : Prop :=
   flag_pre f k ∧
-  (b = true ↔ ((f / (2 ^ (k).toNat)) % 2) = 1)
+  (b = true ↔ ((f / (2 ^ k.toNat)) % 2) = 1)
 
 /-! ## rel zero -/
 
@@ -399,7 +400,7 @@ def compress_body (data : List U8) (level : U8) (o : (List U8) → U8 → List U
   out = (o data level) ∧
   (out.length : ℤ) ≥ 18 ∧
   ((out.drop 0).take 8) = [31#u8, 139#u8, 8#u8, 0#u8, 0#u8, 0#u8, 0#u8, 0#u8] ∧
-  ((out[8]!).val : ℤ) = (if (level.val : ℤ) = 0 then 0 else (if (level.val : ℤ) < 5 then 4 else 2)) ∧
+  ((out[8]!).val : ℤ) = (if (level.val : ℤ) = 0 then 0 else (if (level.val : ℤ) < 5 then 4 else 2 : ℤ) : ℤ) ∧
   ((out[9]!).val : ℤ) = 255
 
 /-- `compress` is weakly specified: the implementer chooses `o` — each a function of

@@ -172,6 +172,12 @@ pub fn reset_work(cfg: &Config) -> Result<std::path::PathBuf, String> {
     if helpers.exists() {
         let _ = fs::rename(&helpers, backup.join("Proofs"));
     }
+    // the optimize history (and its checkpoint) belongs to the old implementation
+    let opt_log = crate::optimize::OptimizeLog::path(cfg);
+    if opt_log.exists() {
+        let _ = fs::rename(&opt_log, backup.join("optimize.json"));
+    }
+    let _ = fs::remove_dir_all(cfg.state_dir().join("optimize"));
     // the Aeneas model of the old implementation must not leak into the new run
     let _ = fs::remove_dir_all(cfg.lean_dir().join("Code"));
     let _ = fs::remove_file(cfg.translation_path());
@@ -240,6 +246,10 @@ pub fn restore(cfg: &Config, id: Option<&str>) -> Result<bool, String> {
     if src.join("Proofs").is_dir() {
         let _ = fs::remove_dir_all(cfg.lean_dir().join("Proofs"));
         copy_tree(&src.join("Proofs"), &cfg.lean_dir().join("Proofs"))?;
+    }
+    // its optimize history, which a later `optimize` resumes
+    if src.join("optimize.json").exists() {
+        let _ = fs::copy(src.join("optimize.json"), crate::optimize::OptimizeLog::path(cfg));
     }
     eprintln!("restored backup {name} ({}); verifying", describe_backup(&src));
     let r = verify::verify(cfg, None, &mut Log::new(true));
@@ -444,9 +454,19 @@ pub fn implement(cfg: &Config, opts: Opts, bin: &Path) -> Result<bool, String> {
     if cfg.solution_dir().exists() {
         eprintln!("== initial verify (to populate the Aeneas model, if the solution builds)");
         let r = verify::verify(cfg, None, &mut Log::new(false));
-        eprintln!("initial state: {}", if r.pass { "PASS already".to_string() } else { format!("FAIL at {}", r.stage) });
-        if r.pass {
-            eprintln!("nothing to do: every obligation is already verified (use -B to reimplement from scratch)");
+        // a PASS of the specification alone is no reason to stop: `fn`s without
+        // an implementation have no `impl_correct` obligation yet
+        let missing = r.unimplemented();
+        eprintln!(
+            "initial state: {}",
+            match (r.pass, missing.is_empty()) {
+                (true, true) => "PASS already".to_string(),
+                (true, false) => format!("specification verified; not implemented yet: {}", missing.join(", ")),
+                _ => format!("FAIL at {}", r.stage),
+            }
+        );
+        if r.pass && missing.is_empty() {
+            eprintln!("nothing to do: every function is implemented and every obligation verified (use -B to reimplement from scratch)");
             return Ok(true);
         }
     }
@@ -545,7 +565,7 @@ pub fn implement(cfg: &Config, opts: Opts, bin: &Path) -> Result<bool, String> {
         let _ = mon.join();
         // the agent's last verify already synced its files and wrote the report;
         // if that was a PASS after the job started, do not spend another run
-        let fresh_pass = verify::Report::load(cfg).map(|r| r.pass && r.time >= started).unwrap_or(false);
+        let fresh_pass = verify::Report::load(cfg).map(|r| r.pass && r.unimplemented().is_empty() && r.time >= started).unwrap_or(false);
         let r = if fresh_pass {
             eprintln!("\n== agent exited ({st}); its last verify already PASSED");
             verify::Report::load(cfg).unwrap()
@@ -560,10 +580,13 @@ pub fn implement(cfg: &Config, opts: Opts, bin: &Path) -> Result<bool, String> {
         if fs::read_to_string(jail.join("exit-code")).map(|t| t.trim() == "limit").unwrap_or(false) {
             eprintln!("the agent was stopped by the spending limit");
         }
+        if let Some(e) = &u.api_error {
+            eprintln!("the agent stopped on an API error: {e}");
+        }
         if !u.last_message.is_empty() {
             eprintln!("agent's last message:\n{}", u.last_message);
         }
-        Ok(r.pass)
+        Ok(r.pass && r.unimplemented().is_empty())
     }
 }
 
@@ -725,7 +748,8 @@ pub fn run_foreground(cfg: &Config, opts: &Opts, prompt: &str, bin: &Path, stop:
             break false;
         }
         match child.try_wait() {
-            Ok(Some(st)) => break st.success(),
+            // run.sh always exits 0: the agent's own status is in `exit-code`
+            Ok(Some(_)) => break fs::read_to_string(jail.join("exit-code")).map(|t| t.trim() == "0").unwrap_or(false),
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(300)),
             Err(e) => return Err(e.to_string()),
         }

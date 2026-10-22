@@ -128,14 +128,8 @@ pub fn load_config(manifest: &Path) -> Result<Config, String> {
         .unwrap_or(toml::Value::Table(Default::default()));
     let get = |k: &str| meta.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     let env = |k: &str| std::env::var(k).ok();
-    let ns = get("namespace").unwrap_or_else(|| {
-        let mut c = crate_name.chars();
-        match c.next() {
-            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            None => String::new(),
-        }
-        .replace('-', "_")
-    });
+    // the build gate derives it the same way, to find the proofs it fingerprints
+    let ns = djinn_syntax::project::namespace(get("namespace").as_deref(), &crate_name);
     if ["Sort", "Type", "Prop", "List", "Option", "Result", "Aeneas", "Std", "Lean", "Mathlib"].contains(&ns.as_str()) {
         return Err(format!("namespace `{ns}` clashes with a Lean keyword or library; set [package.metadata.djinn] namespace"));
     }

@@ -14,13 +14,17 @@ open Aeneas Std Result
 set_option linter.unusedSimpArgs false
 set_option linter.unusedVariables false
 set_option linter.unusedTactic false
+set_option maxHeartbeats 1000000
+
+open scoped Classical
 
 namespace StrMap.Spec
 
 /-! ## func byte_len -/
 
 def byte_len_pre (s : List U8) : Prop :=
-  (s.length : ℤ) ≤ ((Usize.max : ℕ) : ℤ)
+  (s.length : ℤ) ≤ ((Usize.max : ℕ) : ℤ) ∧
+  (∃ s' : String, Djinn.Vocab.bytes s' = s)
 
 def byte_len_spec (s : List U8) (r : Usize) : Prop :=
   byte_len_pre s ∧

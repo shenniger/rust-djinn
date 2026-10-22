@@ -112,4 +112,141 @@ theorem getElem!_mem {α : Type} [Inhabited α] (l : List α) (k : Nat) (hk : k 
 theorem count_le_length' {α : Type} [BEq α] (a : α) (l : List α) : l.count a ≤ l.length :=
   List.count_le_length
 
+/-! ## The `memchr` crate: first and last index of a byte -/
+
+/-- The first index of `n` in `l`, if any: the model of `memchr::memchr`. -/
+def memchr (n : U8) (l : List U8) : Option Nat := l.findIdx? (· == n)
+
+/-- The last index of `n` in `l`, if any: the model of `memchr::memrchr`. -/
+def memrchr (n : U8) (l : List U8) : Option Nat :=
+  (l.reverse.findIdx? (· == n)).map (fun i => l.length - 1 - i)
+
+theorem memchr_eq_none {n : U8} {l : List U8} : memchr n l = none ↔ n ∉ l := by
+  simp only [memchr, List.findIdx?_eq_none_iff, beq_eq_false_iff_ne]
+  constructor
+  · intro h hn; exact h n hn rfl
+  · intro h x hx hxn; subst hxn; exact h hx
+
+theorem memchr_eq_some {n : U8} {l : List U8} {i : Nat} :
+    memchr n l = some i ↔ i < l.length ∧ l[i]! = n ∧ ∀ j, j < i → l[j]! ≠ n := by
+  unfold memchr
+  rw [List.findIdx?_eq_some_iff_findIdx_eq]
+  constructor
+  · rintro ⟨hi, hf⟩
+    rw [List.findIdx_eq hi] at hf
+    obtain ⟨h1, h2⟩ := hf
+    refine ⟨hi, ?_, ?_⟩
+    · rw [getElem!_pos l i hi]; simpa using h1
+    · intro j hj; rw [getElem!_pos l j (by omega)]; simpa using h2 j hj
+  · rintro ⟨hi, h1, h2⟩
+    refine ⟨hi, ?_⟩
+    rw [List.findIdx_eq hi]
+    refine ⟨?_, ?_⟩
+    · rw [getElem!_pos l i hi] at h1; simpa using h1
+    · intro j hj; have := h2 j hj; rw [getElem!_pos l j (by omega)] at this; simpa using this
+
+theorem memrchr_eq_none {n : U8} {l : List U8} : memrchr n l = none ↔ n ∉ l := by
+  simp only [memrchr, Option.map_eq_none_iff, List.findIdx?_eq_none_iff, List.mem_reverse, beq_eq_false_iff_ne]
+  constructor
+  · intro h hn; exact h n hn rfl
+  · intro h x hx hxn; subst hxn; exact h hx
+
+theorem memrchr_eq_some {n : U8} {l : List U8} {i : Nat} :
+    memrchr n l = some i ↔ i < l.length ∧ l[i]! = n ∧ ∀ j, i < j → j < l.length → l[j]! ≠ n := by
+  unfold memrchr
+  constructor
+  · intro h
+    rw [Option.map_eq_some_iff] at h
+    obtain ⟨k, hk, hki⟩ := h
+    rw [List.findIdx?_eq_some_iff_findIdx_eq] at hk
+    obtain ⟨hk, hf⟩ := hk
+    have hk' : k < l.length := by simpa using hk
+    rw [List.findIdx_eq hk] at hf
+    obtain ⟨h1, h2⟩ := hf
+    rw [List.getElem_reverse] at h1
+    subst hki
+    refine ⟨by omega, ?_, ?_⟩
+    · rw [getElem!_pos l _ (by omega)]; simpa using h1
+    · intro j hij hj
+      have := h2 (l.length - 1 - j) (by omega)
+      rw [List.getElem_reverse, getElem_congr_idx (by omega : l.length - 1 - (l.length - 1 - j) = j)] at this
+      rw [getElem!_pos l j hj]
+      simpa using this
+  · rintro ⟨hi, h1, h2⟩
+    rw [Option.map_eq_some_iff]
+    refine ⟨l.length - 1 - i, ?_, by omega⟩
+    rw [List.findIdx?_eq_some_iff_findIdx_eq]
+    have hlt : l.length - 1 - i < l.reverse.length := by simp; omega
+    refine ⟨hlt, ?_⟩
+    rw [List.findIdx_eq hlt]
+    refine ⟨?_, ?_⟩
+    · rw [List.getElem_reverse, getElem_congr_idx (by omega : l.length - 1 - (l.length - 1 - i) = i)]
+      rw [getElem!_pos l i hi] at h1; simpa using h1
+    · intro k hk
+      rw [List.getElem_reverse]
+      have hj := h2 (l.length - 1 - k) (by omega) (by omega)
+      rw [getElem!_pos l _ (by omega)] at hj
+      simpa using hj
+
+/-- `v.extend_from_slice(s)`: Aeneas models it but states no `step` lemma.
+    With a clone that is the identity on `s` (every scalar's), the result is
+    `v ++ s`, and it does not panic while the length fits. Not a global
+    `@[step]` lemma (proofs that state their own would see two): use
+    `step with Djinn.Vocab.extend_from_slice_spec` or
+    `attribute [local step] Djinn.Vocab.extend_from_slice_spec`. -/
+theorem extend_from_slice_spec {T : Type} (cloneInst : core.clone.Clone T) (v : alloc.vec.Vec T) (s : Aeneas.Std.Slice T)
+    (hc : ∀ x ∈ s.val, cloneInst.clone x = ok x) (h : v.length + s.length ≤ Usize.max) :
+    alloc.vec.Vec.extend_from_slice cloneInst v s ⦃ r => r.val = v.val ++ s.val ⦄ := by
+  have hcl := Slice.clone_spec (clone := cloneInst.clone) hc
+  rw [WP.spec_equiv_exists] at hcl
+  obtain ⟨s', hs', hss⟩ := hcl
+  subst hss
+  unfold alloc.vec.Vec.extend_from_slice
+  rw [dif_pos h]
+  split
+  · rename_i s'' h'
+    simp [hs'] at h'
+    subst h'
+    simp
+  · rename_i h'
+    simp [hs'] at h'
+  · rename_i h'
+    simp [hs'] at h'
+
+/-- `slice.sort()`'s model: an insertion sort with Rust's `Ord::cmp`.
+    `insertM` puts `x` before the first element it is not greater than;
+    `sortM` inserts each element into the sorted rest of the list, so an
+    element ends up before the equal ones after it: the sort is stable. -/
+def insertM {T : Type} (cmp : T → T → Result Ordering) (x : T) : List T → Result (List T)
+  | [] => ok [x]
+  | y :: ys => do
+    let o ← cmp x y
+    if o ≠ .gt then ok (x :: y :: ys) else do
+      let r ← insertM cmp x ys
+      ok (y :: r)
+
+def sortM {T : Type} (cmp : T → T → Result Ordering) : List T → Result (List T)
+  | [] => ok []
+  | x :: xs => do
+    let s ← sortM cmp xs
+    insertM cmp x s
+
+/-- With a comparison that never fails, the model is Mathlib's insertion sort
+    by "not greater": sorted (`List.sorted_insertionSort`) and a permutation
+    (`List.perm_insertionSort`). -/
+theorem sortM_ok {T : Type} (f : T → T → Ordering) (l : List T) :
+    sortM (fun a b => ok (f a b)) l = ok (l.insertionSort (fun a b => f a b ≠ .gt)) := by
+  have hins : ∀ (x : T) (m : List T), insertM (fun a b => ok (f a b)) x m = ok (m.orderedInsert (fun a b => f a b ≠ .gt) x) := by
+    intro x m
+    induction m with
+    | nil => rw [insertM, List.orderedInsert_nil]
+    | cons y ys ih =>
+      rw [insertM, List.orderedInsert_cons]
+      by_cases h : f x y ≠ .gt
+      · simp [h]
+      · simp [h, ih]
+  induction l with
+  | nil => rw [sortM, List.insertionSort_nil]
+  | cons x xs ih => rw [sortM, List.insertionSort_cons, ih]; simp [hins]
+
 end Djinn.Vocab
