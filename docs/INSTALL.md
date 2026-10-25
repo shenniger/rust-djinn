@@ -100,7 +100,7 @@ mkdir -p tools && cd tools
 git clone https://github.com/AeneasVerif/aeneas
 cd aeneas && git checkout 557eff83
 make setup-charon        # clones Charon at the commit in ./charon-pin and builds it (Rust + OCaml)
-make build-bin           # builds ./bin/aeneas
+make                     # builds ./bin/aeneas
 ```
 
 `make setup-charon` takes a while: it builds Charon's rustc driver with
