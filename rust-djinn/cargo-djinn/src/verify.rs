@@ -6,6 +6,7 @@ use djinn_syntax::emit::{self, EmitCx};
 use djinn_syntax::lower::Lowered;
 use djinn_syntax::project::SpecFile;
 use djinn_syntax::types::TypeNames;
+use djinn_syntax::project::Backend;
 use djinn_syntax::{Kind, Program};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -81,6 +82,10 @@ struct RunEntry {
     /// when the files on disk no longer match it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     evidence: String,
+    /// The verifier the proofs are for (`lean`, `verus`); absent in reports
+    /// written before backends existed (Lean).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    backend: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -111,6 +116,9 @@ pub struct Report {
     pub log_tail: Vec<String>,
     /// The fingerprint of the solution and proof files this verify checked.
     pub evidence: String,
+    /// The backend that wrote the report.
+    #[serde(skip)]
+    pub backend: Backend,
 }
 
 impl Report {
@@ -137,7 +145,8 @@ impl Report {
             declarations.push(DeclStatus { name: d.name, kind: d.kind, implemented: d.implemented, obligations: names, tokens: d.tokens, uses: d.uses, ok: d.ok, weak: d.weakly_specified });
         }
         let log_tail = fs::read_to_string(Report::log_path(cfg)).map(|t| t.lines().map(|s| s.to_string()).collect()).unwrap_or_default();
-        Some(Report { time: f.run.unix_time, duration_secs: f.run.duration_secs, pass: f.run.pass, stage: f.run.stage, obligations, declarations, errors: f.run.errors, log_tail, evidence: f.run.evidence })
+        let backend = Backend::parse(&f.run.backend).unwrap_or(Backend::Lean);
+        Some(Report { time: f.run.unix_time, duration_secs: f.run.duration_secs, pass: f.run.pass, stage: f.run.stage, obligations, declarations, errors: f.run.errors, log_tail, evidence: f.run.evidence, backend })
     }
     /// Decide `ok` per declaration: implemented (funcs), and every obligation
     /// of it and of the declarations it uses, transitively, proved.
@@ -151,7 +160,9 @@ impl Report {
             .map(|d| d.implemented && djinn_syntax::project::closure(&d.name, &[&uses]).iter().all(|n| by_name.get(n).map(|x| proved(x)).unwrap_or(false)))
             .collect();
         for (d, ok) in self.declarations.iter_mut().zip(oks) {
-            d.ok = ok;
+            // an ambient function of the Verus backend is right when its mirror
+            // verifies against its translation, which only a passing run shows
+            d.ok = if d.kind == "ambient" && self.backend == Backend::Verus { self.pass } else { ok };
         }
     }
     pub fn save(&self, cfg: &Config) {
@@ -176,7 +187,7 @@ impl Report {
             })
             .collect();
         let f = ReportFile {
-            run: RunEntry { time: format!("{} UTC", fmt_time(self.time)), unix_time: self.time, duration_secs: self.duration_secs, pass: self.pass, stage: self.stage.clone(), errors: self.errors.clone(), evidence: self.evidence.clone() },
+            run: RunEntry { time: format!("{} UTC", fmt_time(self.time)), unix_time: self.time, duration_secs: self.duration_secs, pass: self.pass, stage: self.stage.clone(), errors: self.errors.clone(), evidence: self.evidence.clone(), backend: self.backend.name().to_string() },
             decl,
         };
         if let Ok(s) = toml::to_string_pretty(&f) {
@@ -197,6 +208,8 @@ impl Report {
             // the specification's obligations hold, but the crate does not build:
             // a `fn` without an implementation has no `impl_correct` yet
             s.push_str(&format!("PASS (specification only): every obligation so far is proved, but {} fn(s) are not implemented: {}. `cargo djinn implement` continues from here.\n", missing.len(), missing.join(", ")));
+        } else if self.pass && self.backend == Backend::Verus {
+            s.push_str("PASS: every obligation is proved (Verus verified the whole project with no cheating).\n");
         } else if self.pass {
             s.push_str("PASS: every obligation is proved and the axiom audit is clean.\n");
         } else {
@@ -219,7 +232,7 @@ impl Report {
     }
 }
 
-fn fail_at(cfg: &Config, e: djinn_syntax::Error) -> String {
+pub(crate) fn fail_at(cfg: &Config, e: djinn_syntax::Error) -> String {
     let s = e.span.start();
     let file = cfg.specs().get(e.file).map(|f| f.path.display().to_string()).unwrap_or_else(|| cfg.specs_display());
     format!("{file}:{}:{}: error: {}", s.line, s.column + 1, e.msg)
@@ -234,6 +247,9 @@ pub fn module_of(specs: &[SpecFile], prog: &Program, name: &str) -> Option<Strin
 /// Rust name → Lean name, from Aeneas's `translation.json` when present,
 /// otherwise predicted from the module the stubs live in.
 pub fn impl_names(cfg: &Config) -> HashMap<String, String> {
+    if cfg.is_verus() {
+        return crate::verify_verus::impl_names(cfg);
+    }
     let mut m = impl_names_from_json(cfg);
     // without any Aeneas output there is no implementation to name: the
     // `impl_correct` obligations appear after the first verify
@@ -258,6 +274,9 @@ pub fn impl_names(cfg: &Config) -> HashMap<String, String> {
 /// when Aeneas has run, else predicted from the namespace and the spec module
 /// (`Lz77.spec.Token`).
 pub fn type_names(cfg: &Config, prog: &Program) -> TypeNames {
+    if cfg.is_verus() {
+        return crate::verify_verus::type_names(cfg, prog);
+    }
     let mut m = TypeNames::new();
     let specs = cfg.specs();
     let predict = |n: &str| cfg.lean_name(module_of(&specs, prog, n).as_deref(), n);
@@ -400,6 +419,9 @@ pub fn spec_entries(cfg: &Config) -> Vec<djinn_syntax::project::Entry> {
 pub fn lower_spec(cfg: &Config) -> Result<Vec<Lowered>, String> {
     let prog = parse_spec(cfg)?;
     let names = type_names(cfg, &prog);
+    if cfg.is_verus() {
+        return djinn_syntax::lower_verus::lower_program(&prog, &names).map_err(|e| fail_at(cfg, e));
+    }
     djinn_syntax::lower_program_named(&prog, &names).map_err(|e| fail_at(cfg, e))
 }
 
@@ -489,6 +511,9 @@ pub fn needs_types(lowered: &[Lowered]) -> bool {
 
 
 pub fn decl_statuses(cfg: &Config, lowered: &[Lowered], names: &HashMap<String, String>) -> Vec<DeclStatus> {
+    if cfg.is_verus() {
+        return crate::verify_verus::decl_statuses(cfg, lowered, names);
+    }
     let fns = solution_fns(cfg);
     let tn = parse_spec(cfg).map(|p| type_names(cfg, &p)).unwrap_or_default();
     let cx = emit_cx(cfg, lowered, names, &tn);
@@ -635,7 +660,7 @@ fn model_of(w: &str, f: &str, modules: &[String]) -> Option<String> {
 /// Split a Lean file into top-level segments: each command (`theorem`, `def`,
 /// …) with the attributes and doc comment that precede it. `import`, `open`,
 /// `namespace`, `end`, `set_option` and comments form segments of their own.
-fn lean_segments(text: &str) -> Vec<String> {
+pub(crate) fn lean_segments(text: &str) -> Vec<String> {
     const STARTS: &[&str] = &["theorem ", "lemma ", "def ", "abbrev ", "instance ", "example ", "noncomputable ", "private ", "protected ", "structure ", "inductive ", "@[", "/--", "/-!", "/-", "import ", "open ", "namespace ", "end ", "section ", "set_option ", "attribute ", "variable ", "#"];
     const PREFIX: &[&str] = &["@[", "/--"];
     let mut segs: Vec<String> = Vec::new();
@@ -768,47 +793,11 @@ fn archive_stale(cfg: &Config, lowered: &[Lowered], cx: &EmitCx, log: &mut Log, 
             }
         }
     }
-    // Rust: `pub fn` items of removed funcs — unless other solution code still
-    // calls them, in which case they have become helpers and stay
-    let (removed_funcs, kept): (Vec<String>, Vec<String>) = removed_funcs.into_iter().partition(|n| !djinn_syntax::project::rust_fn_referenced(&cfg.solution_dir(), n));
-    for k in &kept {
-        log.line(&format!("kept `{k}` in the solution as a helper: the specification no longer declares it, but other solution code calls it"));
-    }
-    if !removed_funcs.is_empty() && archive_rust {
-        let mut n = 0usize;
-        for file in rust_files(&cfg.solution_dir()) {
-            let Ok(src) = fs::read_to_string(&file) else { continue };
-            let Ok(ast) = syn::parse_file(&src) else { continue };
-            let mut cut: Vec<(usize, usize)> = Vec::new(); // 1-based inclusive line ranges
-            for item in &ast.items {
-                if let syn::Item::Fn(f) = item {
-                    if removed_funcs.contains(&f.sig.ident.to_string()) {
-                        use syn::spanned::Spanned;
-                        let sp = item.span();
-                        cut.push((sp.start().line, sp.end().line));
-                    }
-                }
-            }
-            if cut.is_empty() {
-                continue;
-            }
-            let lines: Vec<&str> = src.split_inclusive('\n').collect();
-            let mut kept = String::new();
-            for (i, l) in lines.iter().enumerate() {
-                let ln = i + 1;
-                if cut.iter().any(|(a, b)| ln >= *a && ln <= *b) {
-                    stale_rust.push_str(l);
-                } else {
-                    kept.push_str(l);
-                }
-            }
-            stale_rust.push('\n');
-            n += cut.len();
-            fs::write(&file, kept).map_err(|e| e.to_string())?;
-        }
-        if n > 0 {
-            notes.push(format!("{n} Rust function(s) implementing removed {}", removed_funcs.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")));
-        }
+    // Rust: `pub fn` items of removed funcs
+    let (removed_funcs, cut) = archive_rust_fns(cfg, removed_funcs, log, archive_rust)?;
+    stale_rust.push_str(&cut);
+    if !removed_funcs.is_empty() && !cut.is_empty() {
+        notes.push(format!("{} Rust function(s) implementing removed {}", removed_funcs.len(), removed_funcs.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")));
     }
     if notes.is_empty() {
         return Ok(());
@@ -825,10 +814,62 @@ fn archive_stale(cfg: &Config, lowered: &[Lowered], cx: &EmitCx, log: &mut Log, 
     Ok(())
 }
 
+/// The implementations of removed `fn`s, cut out of the solution — unless
+/// other solution code still calls them, in which case they have become
+/// helpers and stay (said in the log). Returns the names actually cut and
+/// the text removed (for the backup); with `archive_rust` off nothing is
+/// cut (a jail would push the function back on its next verify).
+pub(crate) fn archive_rust_fns(cfg: &Config, removed_funcs: Vec<String>, log: &mut Log, archive_rust: bool) -> Result<(Vec<String>, String), String> {
+    let (removed_funcs, kept): (Vec<String>, Vec<String>) = removed_funcs.into_iter().partition(|n| !djinn_syntax::project::rust_fn_referenced(&cfg.solution_dir(), n));
+    for k in &kept {
+        log.line(&format!("kept `{k}` in the solution as a helper: the specification no longer declares it, but other solution code calls it"));
+    }
+    let mut stale_rust = String::new();
+    if removed_funcs.is_empty() || !archive_rust {
+        return Ok((removed_funcs, stale_rust));
+    }
+    for file in rust_files(&cfg.solution_dir()) {
+        let Ok(src) = fs::read_to_string(&file) else { continue };
+        let Ok(ast) = syn::parse_file(&src) else { continue };
+        let mut cut: Vec<(usize, usize)> = Vec::new(); // 1-based inclusive line ranges
+        for item in &ast.items {
+            if let syn::Item::Fn(f) = item {
+                if removed_funcs.contains(&f.sig.ident.to_string()) {
+                    use syn::spanned::Spanned;
+                    let sp = item.span();
+                    cut.push((sp.start().line, sp.end().line));
+                }
+            }
+        }
+        if cut.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = src.split_inclusive('\n').collect();
+        let mut kept = String::new();
+        for (i, l) in lines.iter().enumerate() {
+            let ln = i + 1;
+            if cut.iter().any(|(a, b)| ln >= *a && ln <= *b) {
+                stale_rust.push_str(l);
+            } else {
+                kept.push_str(l);
+            }
+        }
+        stale_rust.push('\n');
+        fs::write(&file, kept).map_err(|e| e.to_string())?;
+    }
+    Ok((removed_funcs, stale_rust))
+}
+
 /// The solution is safe Rust: `src/lib.rs` (or `main.rs`) includes it as a
 /// module under `#[forbid(unsafe_code)]` (or forbids it crate-wide), and no
-/// solution file contains the `unsafe` keyword. Aeneas only models safe Rust,
-/// so this is what makes "the verifier never sees `unsafe`" true.
+/// solution file contains the `unsafe` keyword. Neither verifier reasons
+/// about unsafe code (Aeneas models safe Rust only; Verus requires
+/// unsafe blocks to be marked `external`, which the audit bans), so this is
+/// what makes "the verifier never sees `unsafe`" true. Every regular file
+/// under the solution directory counts, whatever its name: rustc compiles a
+/// `#[path = "impl.txt"]` module too, so a file that is not Rust is refused
+/// (`audit_file`), and a `#[path]`/`include!` target must be an `.rs` file
+/// inside the solution directory (`solution_escapes`).
 pub fn check_safe(cfg: &Config) -> Result<(), String> {
     use quote::ToTokens;
     fn forbids(attrs: &[syn::Attribute]) -> bool {
@@ -853,25 +894,46 @@ pub fn check_safe(cfg: &Config) -> Result<(), String> {
             _ => false,
         })
     }
-    for f in rust_files(&cfg.solution_dir()) {
-        let Ok(src) = fs::read_to_string(&f) else { continue };
-        if let Ok(ts) = src.parse::<proc_macro2::TokenStream>() {
-            if has_unsafe(ts) {
-                return Err(format!("FAIL: {} contains `unsafe`; the solution must be safe Rust (Aeneas models only safe code)", cfg.rel(&f)));
-            }
+    let sol = cfg.solution_dir();
+    for f in all_files(&sol) {
+        let bytes = fs::read(&f).map_err(|e| format!("FAIL: {}: {e}", cfg.rel(&f)))?;
+        let ts = audit_file(cfg, &f, &bytes, &[&sol])?;
+        djinn_syntax::project::solution_escapes(&sol, &f, &bytes).map_err(|e| format!("FAIL: {}", e.replace(&format!("{}/", cfg.crate_dir.display()), "")))?;
+        if has_unsafe(ts) {
+            return Err(format!("FAIL: {} contains `unsafe`; the solution must be safe Rust (the verifier reasons about safe code only)", cfg.rel(&f)));
         }
     }
     Ok(())
 }
 
-fn rust_files(dir: &Path) -> Vec<std::path::PathBuf> {
+/// A file of the implementer's as Rust tokens. Every regular file under the
+/// implementer's directories must be Rust: rustc compiles whatever a
+/// `#[path = "…"]` names, whatever its extension, and the audits are what
+/// keep the verified code and the compiled code the same file — so a file
+/// that does not tokenize as Rust (a note, a data file, a stray editor
+/// backup) is refused rather than skipped.
+pub(crate) fn audit_file(cfg: &Config, f: &Path, bytes: &[u8], dirs: &[&Path]) -> Result<proc_macro2::TokenStream, String> {
+    let where_ = dirs.iter().map(|d| cfg.rel(d)).collect::<Vec<_>>().join(", ");
+    let src = std::str::from_utf8(bytes).map_err(|_| format!("FAIL: {} is not UTF-8 text; every file under {where_} is compiled or audited as Rust source (keep notes and data elsewhere)", cfg.rel(f)))?;
+    src.parse::<proc_macro2::TokenStream>().map_err(|_| format!("FAIL: {} cannot be read as Rust tokens; every file under {where_} is compiled or audited as Rust source, whatever its name (keep notes and data elsewhere)", cfg.rel(f)))
+}
+
+/// Every Rust source (`.rs`) under `dir`, for the tools that parse items
+/// (`syn`); the audits use `all_files`, which skips nothing.
+pub(crate) fn rust_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    all_files(dir).into_iter().filter(|p| p.extension().map(|x| x == "rs").unwrap_or(false)).collect()
+}
+
+/// Every regular file under `dir`, whatever its name or extension (what the
+/// evidence fingerprint covers, and so what the audits must cover).
+pub(crate) fn all_files(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut v = Vec::new();
     fn walk(d: &Path, v: &mut Vec<std::path::PathBuf>) {
         for e in fs::read_dir(d).into_iter().flatten().flatten() {
             let p = e.path();
             if p.is_dir() {
                 walk(&p, v);
-            } else if p.extension().map(|x| x == "rs").unwrap_or(false) {
+            } else {
                 v.push(p);
             }
         }
@@ -886,6 +948,16 @@ pub fn translate(cfg: &Config, log: &mut Log) -> Result<Vec<Lowered>, String> {
     translate_opts(cfg, log, true)
 }
 
+/// Does the implementer's proof file hold more than the skeleton (a proof
+/// begun)?
+pub fn proofs_started(cfg: &Config) -> bool {
+    let text = fs::read_to_string(cfg.proof_main()).unwrap_or_default();
+    match cfg.backend {
+        Backend::Lean => text.matches("theorem ").count() > text.matches(":= by\n  sorry").count(),
+        Backend::Verus => text.matches("proof fn ").count() > text.matches(djinn_syntax::emit_verus::TODO).count(),
+    }
+}
+
 /// `archive_rust = false` while verifying from a jail: the jail would push the
 /// removed function back on its next verify, so the human's own `translate`
 /// does that archiving.
@@ -894,19 +966,29 @@ pub fn translate(cfg: &Config, log: &mut Log) -> Result<Vec<Lowered>, String> {
 /// stable proc macros cannot track a directory, so a newly added file would
 /// otherwise reach the gate only with the next rebuild. Written once; a crate
 /// with a build script of its own is told what to add.
-fn gate_build_script(cfg: &Config, log: &mut Log) -> Result<(), String> {
-    let lines = [cfg.rel(&cfg.solution_dir()), cfg.rel(&cfg.lean_dir())].map(|d| d.replace('\\', "/")).map(|d| format!("cargo:rerun-if-changed={d}"));
+pub(crate) fn gate_build_script(cfg: &Config, log: &mut Log) -> Result<(), String> {
+    // the implementer's proof files of the backend: `<proofs>/<NS>/` (Lean),
+    // `<verus>/src/` (Verus: `proofs.rs` and `proofs/`)
+    let proof_dir = match cfg.backend {
+        Backend::Lean => cfg.lean_dir(),
+        Backend::Verus => cfg.verus_src(),
+    };
+    let lines = [cfg.rel(&cfg.solution_dir()), cfg.rel(&proof_dir)].map(|d| d.replace('\\', "/")).map(|d| format!("cargo:rerun-if-changed={d}"));
     let path = cfg.crate_dir.join("build.rs");
     let manifest = fs::read_to_string(cfg.crate_dir.join("Cargo.toml")).unwrap_or_default();
     let own = manifest.lines().any(|l| l.trim_start().starts_with("build") && l.contains('='));
+    const HEADER: &str = "// Written by `cargo djinn translate`: rebuild (and so rerun the djinn build\n// gate) when a file is added under the solution or the proofs.\n";
+    let write = |log: &mut Log, what: &str| -> Result<(), String> {
+        let body: String = lines.iter().map(|l| format!("    println!(\"{l}\");\n")).collect();
+        fs::write(&path, format!("{HEADER}fn main() {{\n{body}}}\n")).map_err(|e| format!("build.rs: {e}"))?;
+        log.line(what);
+        Ok(())
+    };
     match fs::read_to_string(&path) {
         Ok(t) if lines.iter().all(|l| t.contains(l.as_str())) => Ok(()),
-        Err(_) if !own => {
-            let body: String = lines.iter().map(|l| format!("    println!(\"{l}\");\n")).collect();
-            fs::write(&path, format!("// Written by `cargo djinn translate`: rebuild (and so rerun the djinn build\n// gate) when a file is added under the solution or the proofs.\nfn main() {{\n{body}}}\n")).map_err(|e| format!("build.rs: {e}"))?;
-            log.line("wrote build.rs (reruns the build gate when files are added)");
-            Ok(())
-        }
+        // ours, for the other backend (or an older layout): rewritten
+        Ok(t) if t.starts_with(HEADER) && !own => write(log, "rewrote build.rs for this backend's proof directory"),
+        Err(_) if !own => write(log, "wrote build.rs (reruns the build gate when files are added)"),
         _ => {
             log.line(&format!("note: the crate has a build script of its own; add `{}` to it so the build gate sees newly added files", lines.join("`, `")));
             Ok(())
@@ -915,6 +997,9 @@ fn gate_build_script(cfg: &Config, log: &mut Log) -> Result<(), String> {
 }
 
 pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result<Vec<Lowered>, String> {
+    if cfg.is_verus() {
+        return crate::verify_verus::translate_opts(cfg, log, archive_rust);
+    }
     let prog = parse_spec(cfg)?;
     let tn = type_names(cfg, &prog);
     let lowered = djinn_syntax::lower_program_named(&prog, &tn).map_err(|e| fail_at(cfg, e))?;
@@ -1030,7 +1115,7 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
     // an initial report, so that `cargo build` can say "never attempted"
     // precisely and the macro has a file to track
     if !Report::path(cfg).exists() {
-        let mut r = Report { time: now(), duration_secs: 0, pass: false, stage: "not run".into(), obligations: BTreeMap::new(), declarations: decl_statuses(cfg, &lowered, &names), errors: Vec::new(), log_tail: Vec::new(), evidence: String::new() };
+        let mut r = Report { time: now(), duration_secs: 0, pass: false, stage: "not run".into(), obligations: BTreeMap::new(), declarations: decl_statuses(cfg, &lowered, &names), errors: Vec::new(), log_tail: Vec::new(), evidence: String::new(), backend: cfg.backend };
         for d in &r.declarations {
             for o in &d.obligations {
                 r.obligations.insert(o.clone(), "unverified".into());
@@ -1077,7 +1162,7 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
     Ok(lowered)
 }
 
-fn run(cmd: &mut Command, what: &str, log: &mut Log) -> Result<String, String> {
+pub(crate) fn run(cmd: &mut Command, what: &str, log: &mut Log) -> Result<String, String> {
     log.line(&format!("== {what}"));
     let out = cmd.output().map_err(|e| format!("{what}: cannot run: {e}"))?;
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1117,7 +1202,11 @@ pub fn verify(cfg: &Config, jail: Option<&Path>, log: &mut Log) -> Report {
         errors: Vec::new(),
         log_tail: Vec::new(),
         evidence: String::new(),
+        backend: cfg.backend,
     };
+    if cfg.is_verus() {
+        return crate::verify_verus::verify(cfg, jail, log, report);
+    }
     let result = verify_inner(cfg, jail, log, &mut report);
     match result {
         Ok(()) => {
@@ -1518,7 +1607,17 @@ fn verify_inner(cfg: &Config, jail: Option<&Path>, log: &mut Log, report: &mut R
     // 7. axiom audit
     let audit_rel = format!("{}/Audit.lean", cfg.ns);
     fs::write(cfg.proofs.join(&audit_rel), &audit_text).map_err(|e| stage("axiom audit", format!("{audit_rel}: {e}")))?;
-    let audit = run(Command::new("lake").args(["env", "lean", AUDIT_TSTACK, "--run"]).arg(&audit_rel).current_dir(&cfg.proofs), "axiom audit", log).map_err(|e| stage("axiom audit", e))?;
+    // two processes: each imports the Mathlib-based library once (a second
+    // `importModules` in one process copies every olean into the heap, and
+    // the audit then needs more memory than many hosts allow a user)
+    let mut audit = String::new();
+    for phase in ["statements", "replay"] {
+        let out = run(Command::new("lake").args(["env", "lean", AUDIT_TSTACK, "--run"]).arg(&audit_rel).arg(phase).current_dir(&cfg.proofs), &format!("axiom audit ({phase})"), log).map_err(|e| stage("axiom audit", e))?;
+        audit.push_str(&out);
+        if !audit.ends_with('\n') {
+            audit.push('\n');
+        }
+    }
     let verdicts = parse_audit(&audit, &short).map_err(|e| {
         for o in report.obligations.values_mut() {
             *o = "error".into();
@@ -1581,7 +1680,7 @@ fn verify_inner(cfg: &Config, jail: Option<&Path>, log: &mut Log, report: &mut R
 
 /// The bytes of everything Charon and the specification parser read: the
 /// manifest, `src/` and the solution directory.
-fn source_snapshot(cfg: &Config) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+pub(crate) fn source_snapshot(cfg: &Config) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
     fn walk(d: &Path, out: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
         for e in fs::read_dir(d).into_iter().flatten().flatten() {
             let p = e.path();
@@ -1602,7 +1701,7 @@ fn source_snapshot(cfg: &Config) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
 
 /// The fingerprint of the crate's solution and proof files (see the build gate).
 pub fn evidence(cfg: &Config) -> String {
-    djinn_syntax::project::evidence_record(&cfg.crate_dir, &cfg.solution_dir(), &cfg.proofs, &cfg.ns)
+    djinn_syntax::project::evidence_record(&cfg.crate_dir, &cfg.solution_dir(), &cfg.proof_root(), &cfg.ns, cfg.backend)
 }
 
 /// The audit replays proofs in the kernel on a thread of this stack size (in
@@ -1680,6 +1779,21 @@ fn parse_audit(out: &str, obligations: &[String]) -> Result<Vec<AuditVerdict>, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_file_is_enumerated() {
+        use super::*;
+        let d = std::env::temp_dir().join(format!("djinn-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        for f in ["mod.rs", "impl.txt", "sub/a.rs", "sub/note", ".hidden"] {
+            fs::write(d.join(f), "x").unwrap();
+        }
+        let names = |v: Vec<std::path::PathBuf>| v.iter().map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(all_files(&d)), [".hidden", "impl.txt", "mod.rs", "sub/a.rs", "sub/note"]);
+        assert_eq!(names(rust_files(&d)), ["mod.rs", "sub/a.rs"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn string_literals_get_a_kernel_proof() {
         let s = "let s ← f (toStr\n        \"div \\\"by\\\" zero\")\n  ok (toStr \"x\" (by decide))\n  myToStr \"y\"";

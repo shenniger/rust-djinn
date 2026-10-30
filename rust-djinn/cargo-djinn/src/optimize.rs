@@ -365,10 +365,9 @@ fn checkpoint(cfg: &Config) -> Result<(), String> {
     let d = checkpoint_dir(cfg);
     let _ = fs::remove_dir_all(&d);
     copy_tree(&cfg.solution_dir(), &d.join("solution"))?;
-    let proofs = cfg.lean_dir();
-    copy_tree(&proofs.join("Proofs.lean"), &d.join("Proofs.lean"))?;
-    if proofs.join("Proofs").is_dir() {
-        copy_tree(&proofs.join("Proofs"), &d.join("Proofs"))?;
+    copy_tree(&cfg.proof_main(), &d.join("Proofs.main"))?;
+    if cfg.proof_helpers().is_dir() {
+        copy_tree(&cfg.proof_helpers(), &d.join("Proofs"))?;
     }
     Ok(())
 }
@@ -376,8 +375,7 @@ fn checkpoint(cfg: &Config) -> Result<(), String> {
 /// Do the solution and proofs match the last checkpoint?
 fn same_as_checkpoint(cfg: &Config) -> bool {
     let d = checkpoint_dir(cfg);
-    let proofs = cfg.lean_dir();
-    same_tree(&cfg.solution_dir(), &d.join("solution")) && same_tree(&proofs.join("Proofs.lean"), &d.join("Proofs.lean")) && same_tree(&proofs.join("Proofs"), &d.join("Proofs"))
+    same_tree(&cfg.solution_dir(), &d.join("solution")) && same_tree(&cfg.proof_main(), &d.join("Proofs.main")) && same_tree(&cfg.proof_helpers(), &d.join("Proofs"))
 }
 
 /// Two files or directory trees with the same names and contents (both
@@ -412,11 +410,10 @@ fn revert(cfg: &Config, why: &str) -> Result<(), String> {
     }
     let _ = fs::remove_dir_all(cfg.solution_dir());
     copy_tree(&d.join("solution"), &cfg.solution_dir())?;
-    let proofs = cfg.lean_dir();
-    copy_tree(&d.join("Proofs.lean"), &proofs.join("Proofs.lean"))?;
-    let _ = fs::remove_dir_all(proofs.join("Proofs"));
+    copy_tree(&d.join("Proofs.main"), &cfg.proof_main())?;
+    let _ = fs::remove_dir_all(cfg.proof_helpers());
     if d.join("Proofs").is_dir() {
-        copy_tree(&d.join("Proofs"), &proofs.join("Proofs"))?;
+        copy_tree(&d.join("Proofs"), &cfg.proof_helpers())?;
     }
     let r = verify::verify(cfg, None, &mut Log::new(false));
     if !r.pass {
@@ -433,30 +430,32 @@ fn prompt(cfg: &Config, opts: &OptOpts, current: &Measurement, log: &OptimizeLog
     let required = opts.threshold.max(current.noise());
     let size_required = size_threshold(opts);
     let mut p = format!(
-        "You are the OPTIMIZER in a Djinn-on-Aeneas project. The implementation in `{sol}/` is \
+        "You are the OPTIMIZER in a Djinn-on-{backend} project. The implementation in `{sol}/` is \
 already verified against the specification in `{spec}` (read-only). Your job is to make it {goal} on \
 the performance workload below while keeping it verified. Nothing else counts.\n\n\
 Read `GUIDE.md` (in this directory) first; the editing rules are the same as for implementing: edit only \
-`{sol}/` and `{proofs}/{ns}/Proofs.lean` (helpers under `{proofs}/{ns}/Proofs/`). The specification, \
+`{sol}/` and `{pmain}` (helpers under `{phelpers}/`). The specification, \
 `Cargo.toml`, and the workload are read-only; edits to them are discarded.\n\n\
 ## The workload (`{w}`)\n\n```rust\n{source}\n```\n\n\
 ## Current timing\n\n{timing}\n\n\
 ## Acceptance\n\n\
 Your version is kept only if (1) the `verify` tool prints PASS — so when you change the Rust, re-prove \
-`impl_correct` for whatever changed (the Aeneas model of your new code appears in `{proofs}/{ns}/Code/` \
-after a `verify`) — and (2) {rule} Otherwise your \
+`impl_correct` for whatever changed{model} — and (2) {rule} Otherwise your \
 changes are reverted. Measure your jail copy with `./bench` (same method: release build, at least \
 {min:.0} s of iterations per point){tableinfo}.\n\n\
 Approach: profile mentally first — what dominates the workload? Prefer algorithmic improvements \
-(better complexity, fewer passes, no redundant work) over micro-tuning; keep to safe Rust that Aeneas \
+(better complexity, fewer passes, no redundant work) over micro-tuning; keep to safe Rust that {verifier} \
 can model (index loops, scalars; see the guide's Rust section). A faster algorithm usually needs a new \
 loop invariant: budget for the proof.\n\n\
 When `verify` prints PASS and `./bench` shows a gain, stop. Your FINAL message must summarize exactly what \
 you changed and why, and the timing you observed: it becomes the history shown to later attempts.\n",
         spec = cfg.specs_display(),
-        ns = cfg.ns,
         sol = cfg.sol_rel(),
-        proofs = cfg.proofs_rel(),
+        pmain = cfg.proof_main_rel(),
+        phelpers = cfg.proof_helpers_rel(),
+        backend = if cfg.is_verus() { "Verus" } else { "Aeneas" },
+        verifier = if cfg.is_verus() { "Verus" } else { "Aeneas" },
+        model = if cfg.is_verus() { String::new() } else { format!(" (the Aeneas model of your new code appears in `{}/{}/Code/` after a `verify`)", cfg.proofs_rel(), cfg.ns) },
         goal = if current.independent_points() { "FASTER — at some point of the workload, and slower at none" } else if current.is_multi() { "BETTER — faster at every compression ratio, or denser at every speed" } else { "FASTER" },
         timing = if current.is_multi() { format!("{}\n\n```\n{}```", current.line(), current.table()) } else { current.line() },
         rule = if current.independent_points() {

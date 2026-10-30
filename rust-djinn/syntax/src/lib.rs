@@ -1,10 +1,13 @@
 //! djinn-syntax: the specification language shared by the `djinn` macros
 //! (which only parse and check) and `cargo-djinn` (which also lowers to Lean).
 
+pub mod ambient_verus;
 pub mod ast;
 pub mod check;
 pub mod emit;
+pub mod emit_verus;
 pub mod lower;
+pub mod lower_verus;
 pub mod parse;
 pub mod project;
 pub mod types;
@@ -80,6 +83,7 @@ pub fn parse_sources(srcs: &[String]) -> Result<Program> {
         all.types.enums.extend(types.enums);
         all.types.structs.extend(types.structs);
         all.types.consts.extend(types.consts);
+        all.types.structural.extend(types.structural);
         for (n, r) in types.ambient_errors {
             all.types.ambient_errors.entry(n).or_insert(r);
         }

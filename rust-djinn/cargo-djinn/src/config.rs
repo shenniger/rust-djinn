@@ -1,6 +1,7 @@
 //! Crate configuration: `[package.metadata.djinn]` in Cargo.toml.
 
 use std::fs;
+pub use djinn_syntax::project::Backend;
 use djinn_syntax::project::SpecFile;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,16 @@ pub struct Config {
     /// unless `lake_packages` / `DJINN_LAKE_PACKAGES` says otherwise.
     pub lake_packages: PathBuf,
     pub crate_name: String,
+    /// The verifier: `--backend`, `DJINN_BACKEND`, `[package.metadata.djinn]
+    /// backend`, the last report's, Lean.
+    pub backend: Backend,
+    /// `<work_dir>/verus`: the Verus project (`verus_dir` in the metadata).
+    pub verus_dir: PathBuf,
+    /// The `verus` driver (`verus` in the metadata, `DJINN_VERUS`, or on `PATH`).
+    pub verus: String,
+    /// The crate's edition (`package.edition`), which the Verus project is
+    /// verified under too.
+    pub edition: String,
     /// `spec = "src/spec.rs"` or `spec = ["src/a.rs", …]`: the specification
     /// files, given by hand. Without it every `.rs` file under `src/` with a
     /// `djinn!` block is one (see `specs`).
@@ -68,6 +79,53 @@ impl Config {
     pub fn lean_dir(&self) -> PathBuf {
         self.proofs.join(&self.ns)
     }
+    pub fn is_verus(&self) -> bool {
+        self.backend == Backend::Verus
+    }
+    /// The proof project of the backend: the Lean project `proofs`, or the
+    /// Verus project `verus_dir`.
+    pub fn proof_root(&self) -> PathBuf {
+        match self.backend {
+            Backend::Lean => self.proofs.clone(),
+            Backend::Verus => self.verus_dir.clone(),
+        }
+    }
+    pub fn proof_root_rel(&self) -> String {
+        self.rel(&self.proof_root())
+    }
+    /// The implementer's main proof file: `<proofs>/<NS>/Proofs.lean`, or
+    /// `<verus>/src/proofs.rs`.
+    pub fn proof_main(&self) -> PathBuf {
+        match self.backend {
+            Backend::Lean => self.lean_dir().join("Proofs.lean"),
+            Backend::Verus => self.verus_dir.join("src").join("proofs.rs"),
+        }
+    }
+    pub fn proof_main_rel(&self) -> String {
+        self.rel(&self.proof_main())
+    }
+    /// The implementer's helper modules: `<proofs>/<NS>/Proofs/`, or
+    /// `<verus>/src/proofs/`.
+    pub fn proof_helpers(&self) -> PathBuf {
+        match self.backend {
+            Backend::Lean => self.lean_dir().join("Proofs"),
+            Backend::Verus => self.verus_dir.join("src").join("proofs"),
+        }
+    }
+    pub fn proof_helpers_rel(&self) -> String {
+        self.rel(&self.proof_helpers())
+    }
+    /// The Verus project's source directory.
+    pub fn verus_src(&self) -> PathBuf {
+        self.verus_dir.join("src")
+    }
+    /// The generated file a declaration's obligations are stated in.
+    pub fn obligations_file(&self) -> PathBuf {
+        match self.backend {
+            Backend::Lean => self.lean_dir().join("Obligations.lean"),
+            Backend::Verus => self.verus_src().join("obligations.rs"),
+        }
+    }
     /// The specification files, scanned afresh on each call (a file may
     /// gain or lose its `djinn!` blocks while the LSP runs).
     pub fn specs(&self) -> Vec<SpecFile> {
@@ -112,6 +170,12 @@ impl Config {
 }
 
 pub fn load_config(manifest: &Path) -> Result<Config, String> {
+    load_config_with(manifest, None)
+}
+
+/// `load_config`, with the backend given on the command line (which wins
+/// over the environment, the metadata and the last report).
+pub fn load_config_with(manifest: &Path, backend: Option<Backend>) -> Result<Config, String> {
     let text = fs::read_to_string(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
     let toml: toml::Value = toml::from_str(&text).map_err(|e| format!("{}: {e}", manifest.display()))?;
     let crate_dir = manifest
@@ -134,6 +198,16 @@ pub fn load_config(manifest: &Path) -> Result<Config, String> {
         return Err(format!("namespace `{ns}` clashes with a Lean keyword or library; set [package.metadata.djinn] namespace"));
     }
     let work_dir = crate_dir.join(get("work_dir").unwrap_or_else(|| "djinn".into()));
+    let backend = match backend {
+        Some(b) => b,
+        None => {
+            let named = env("DJINN_BACKEND").or_else(|| get("backend"));
+            match named {
+                Some(n) => Backend::parse(&n).ok_or_else(|| format!("unknown backend `{n}`: use `lean` or `verus`"))?,
+                None => fs::read_to_string(work_dir.join("report.toml")).map(|t| Backend::of_report(&t)).unwrap_or(Backend::Lean),
+            }
+        }
+    };
     let lake_packages = get("lake_packages")
         .map(|p| crate_dir.join(p))
         .or_else(|| env("DJINN_LAKE_PACKAGES").map(PathBuf::from))
@@ -151,6 +225,10 @@ pub fn load_config(manifest: &Path) -> Result<Config, String> {
             Some(p) => crate_dir.join(p),
             None => work_dir.join("proofs"),
         },
+        verus_dir: work_dir.join(get("verus_dir").unwrap_or_else(|| "verus".into())),
+        verus: abs_tool(&crate_dir, get("verus").or_else(|| env("DJINN_VERUS")).unwrap_or_else(|| "verus".into())),
+        edition: toml.get("package").and_then(|p| p.get("edition")).and_then(|v| v.as_str()).unwrap_or("2021").to_string(),
+        backend,
         work_dir,
         lake_packages,
         aeneas_lean: get("aeneas_lean").or_else(|| env("DJINN_AENEAS_LEAN")),

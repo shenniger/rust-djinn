@@ -2,7 +2,9 @@
 
 Apart from Rust, you need the following four parts:
 - the Djinn tools themselves
-- the verification toolchain they call (Charon, Aeneas, Lean)
+- the verification toolchain they call: Charon, Aeneas and Lean for the
+  default backend, or Verus for `--backend verus` (part 2b; you need only
+  the one you use)
 - a coding agent
 - the editor plugins
 
@@ -176,11 +178,83 @@ cargo djinn verify
 ```
 
 The run prints its stages, `== cargo build`, `== charon`, `== aeneas`,
-`== lake build`, `== axiom audit`, and ends with `PASS`. The first verify of
-any crate compiles the Lean project and takes a minute or two; later runs
-take about twenty seconds. If `charon` or `aeneas` is reported missing, the
+`== lake build`, `== axiom audit (statements)`, `== axiom audit (replay)`,
+and ends with `PASS`. The first verify of any crate compiles the Lean project
+and takes a minute or two; later runs take about twenty seconds. The audit
+runs as two Lean processes, each importing the Mathlib-based library once
+(about 4.5 GB of resident memory at the peak, most of it the mapped `.olean`
+files); on a host that caps a user's memory at 8 GB this fits, a single
+process importing twice would not. If `charon` or `aeneas` is reported missing, the
 paths in the previous step are wrong; if `lake` complains about Mathlib,
 the shared cache was not created or `lake exe cache get` did not run.
+
+## 2b. Verus (for `--backend verus`)
+
+The Verus backend needs no Charon, Aeneas or Lean: Verus verifies the Rust
+itself ([VERUS.md](VERUS.md) says how). Install a Verus release and tell the
+tools where it is.
+
+### The Verus release
+
+Download the `x86-linux` (or `arm64-macos`, …) zip of a release from
+<https://github.com/verus-lang/verus/releases>, unpack it, and put the
+directory holding the `verus` binary (with `rust_verify`, `z3`,
+`libvstd.rlib`, `vstd.vir` beside it) under `tools/verus/` in the checkout:
+`tools/verus/verus` is what the examples point at. The release pins a Rust
+toolchain (`version.json` names it, e.g. `1.99.1-x86_64-unknown-linux-gnu`);
+`verus` installs it through `rustup` on first use, so `rustup` (and so
+`~/.cargo/bin`) must be on `PATH`. Check:
+
+```sh
+tools/verus/verus --version
+```
+
+The binaries of the 2026 releases need glibc 2.34 or newer (`z3` 2.38). On
+an older system (RHEL/Rocky 8, say) they do not start; the fix we use is a
+private copy of a newer glibc and `libstdc++` under `tools/verus/sysroot/`
+and `patchelf --set-interpreter … --set-rpath '$ORIGIN/sysroot/lib'` on
+`verus`, `rust_verify`, `cargo-verus`, `verusdoc` and `z3` (plus
+`--add-needed libpthread.so.0 --add-needed libdl.so.2 --add-needed librt.so.1`
+for `rust_verify` and `verusdoc`). `tools/verus/sysroot/lib/README.txt` in a
+patched installation documents the exact steps.
+
+### The crate
+
+A Verus-backend crate depends on `vstd`, Verus's standard library, which
+also provides the `verus! { … }` macro the solution is written in (built by
+plain `cargo`, the macro erases the ghost code). Pin the `vstd` version
+published for the installed release: the crates.io versions are dated
+(`vstd = "=0.0.0-2026-10-25-0158"` matches release `0.2026.10.26.d17fbd0`;
+`tools/verus/verus --version` prints the release, and the `vstd` directory
+beside the binary is the same code). A mismatched `vstd` fails the Verus run
+with a library-version error, not a wrong verdict:
+
+```toml
+[dependencies]
+djinn = { path = "/path/to/rust-djinn/rust-djinn" }
+vstd = "=0.0.0-2026-10-25-0158"
+
+[package.metadata.djinn]
+namespace = "MyCrate"
+backend = "verus"                      # or `--backend verus` / DJINN_BACKEND on every command
+verus = "../../tools/verus/verus"      # or DJINN_VERUS, or `verus` on PATH
+```
+
+The first `cargo build` compiles `vstd` from crates.io (about half a minute).
+Optional `[package.metadata.djinn]` keys: `verus_dir` (where the verification
+crate is generated; default `djinn/verus`). The crate's `package.edition` is
+passed to Verus as `--edition`.
+
+### Checking the installation
+
+```sh
+# in the checkout:
+cd example/clamp-verus
+cargo djinn verify
+```
+
+prints `== cargo build`, `== verus (djinn/verus src/lib.rs)`, `verus: 18
+verified, 0 errors`, `PASS`.
 
 ## 3. An agent
 

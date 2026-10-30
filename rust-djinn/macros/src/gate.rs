@@ -8,7 +8,7 @@
 //! jail (`in_jail` in the crate metadata), Clippy (`CLIPPY_ARGS`), and
 //! anything run with `DJINN_GATE=off` (the shipped rust-analyzer configs).
 
-use djinn_syntax::project::{index, stale, Entry};
+use djinn_syntax::project::{index, stale, Backend, Entry};
 use djinn_syntax::{Decl, Kind};
 use quote::{quote, quote_spanned};
 use std::collections::HashMap;
@@ -22,7 +22,9 @@ pub(crate) struct Project {
     /// The crate directory, the Lean project and the namespace: where the
     /// proof files the report's fingerprint covers live.
     dir: PathBuf,
+    /// The proof project of the backend the last report records.
     proofs: PathBuf,
+    backend: Backend,
     ns: String,
     report: PathBuf,
     report_rel: String,
@@ -41,19 +43,30 @@ pub(crate) fn project() -> Option<Project> {
         Some(toml::Value::Array(a)) => Some(a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()),
         _ => None,
     };
-    let proofs = match get("proofs") {
-        Some(p) => dir.join(p),
-        None => dir.join(&work).join("proofs"),
+    // the backend: the report's, else the metadata's, else Lean (the report
+    // is what the gate judges by, so its backend is the one that applies)
+    let report_path = dir.join(&work).join("report.toml");
+    let backend = match fs::read_to_string(&report_path) {
+        Ok(t) => Backend::of_report(&t),
+        Err(_) => get("backend").and_then(|b| Backend::parse(&b)).unwrap_or(Backend::Lean),
+    };
+    let proofs = match backend {
+        Backend::Lean => match get("proofs") {
+            Some(p) => dir.join(p),
+            None => dir.join(&work).join("proofs"),
+        },
+        Backend::Verus => dir.join(&work).join(get("verus_dir").unwrap_or_else(|| "verus".into())),
     };
     let name = toml.get("package").and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or_default();
     let ns = djinn_syntax::project::namespace(get("namespace").as_deref(), name);
     Some(Project {
         proofs,
+        backend,
         ns,
         dir: dir.clone(),
         specs: djinn_syntax::project::spec_files(&dir, manual.as_deref()).into_iter().map(|f| f.path).collect(),
         solution: dir.join(&work).join("solution"),
-        report: dir.join(&work).join("report.toml"),
+        report: report_path,
         report_rel: format!("{work}/report.toml"),
         in_jail: meta.get("in_jail").and_then(|v| v.as_bool()).unwrap_or(false),
     })
@@ -134,7 +147,7 @@ pub fn check(decls: &[Decl], project: Option<&Project>) -> proc_macro2::TokenStr
     // covers, not only the modules rustc reads (a stray or backup file counts
     // too). A file added without any tracked file changing is seen at the
     // next rebuild; `cargo djinn status` and the editor see it at once.
-    let evidence = djinn_syntax::project::evidence(&p.dir, &p.solution, &p.proofs, &p.ns);
+    let evidence = djinn_syntax::project::evidence(&p.dir, &p.solution, &p.proofs, &p.ns, p.backend);
     for f in evidence.iter().flat_map(|e| e.files.iter()) {
         let path = f.to_string_lossy().into_owned();
         out.extend(quote! { const _: &[u8] = include_bytes!(#path); });

@@ -56,6 +56,11 @@ pub struct Lowered {
     /// mention, each after the types it contains (`Spec.lean` derives
     /// `Inhabited` for them in this order).
     pub named_types: Vec<String>,
+    /// Backend-specific definitions the relations refer to, (name, text),
+    /// emitted once each before the relations: the Verus backend's
+    /// structural-equality `spec fn`s for the user types that hold sequences
+    /// (`lower_verus::eq_fn`). Always empty in the Lean backend.
+    pub helpers: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -275,6 +280,7 @@ pub fn lower_with(d: &Decl, decls: &HashMap<String, DeclInfo>, types: &TypeDefs,
         ambient_calls: l.ambient_calls,
         tables: l.tables,
         named_types,
+        helpers: Vec::new(),
     })
 }
 

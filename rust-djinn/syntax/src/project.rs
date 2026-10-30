@@ -139,10 +139,20 @@ pub fn rust_fn_referenced(dir: &Path, name: &str) -> bool {
             _ => false,
         })
     }
+    /// Inside a `verus! { … }` block: the identifier anywhere but right after `fn`.
+    fn has_ident_but_def(ts: TokenStream, name: &str) -> bool {
+        let trees: Vec<TokenTree> = ts.into_iter().collect();
+        trees.iter().enumerate().any(|(i, t)| match t {
+            TokenTree::Ident(id) if id == name => !matches!(trees.get(i.wrapping_sub(1)), Some(TokenTree::Ident(p)) if p == "fn"),
+            TokenTree::Group(g) => has_ident_but_def(g.stream(), name),
+            _ => false,
+        })
+    }
     fn scan(items: &[syn::Item], name: &str) -> bool {
         items.iter().any(|it| match it {
             syn::Item::Fn(f) if f.sig.ident == name => false,
             syn::Item::Mod(m) => m.content.as_ref().map(|(_, items)| scan(items, name)).unwrap_or(false),
+            syn::Item::Macro(m) if is_verus_macro(m) => has_ident_but_def(m.mac.tokens.clone(), name),
             other => has_ident(other.to_token_stream(), name),
         })
     }
@@ -161,8 +171,39 @@ pub fn rust_fn_referenced(dir: &Path, name: &str) -> bool {
     files.iter().any(|f| fs::read_to_string(f).ok().and_then(|s| syn::parse_file(&s).ok()).map(|ast| scan(&ast.items, name)).unwrap_or(false))
 }
 
+/// Is this macro item a `verus! { … }` block (the Verus backend's solutions
+/// are written inside one)?
+fn is_verus_macro(m: &syn::ItemMacro) -> bool {
+    m.mac.path.segments.last().is_some_and(|s| s.ident == "verus")
+}
+
+/// The executable functions a `verus! { … }` block defines at its top level
+/// (and in inline modules): `fn name`, not `spec fn` or `proof fn`, which are
+/// ghost. Bodies are token groups, so nested items are not seen.
+pub fn verus_fns(ts: TokenStream, out: &mut Vec<String>) {
+    let trees: Vec<TokenTree> = ts.into_iter().collect();
+    for (i, t) in trees.iter().enumerate() {
+        match t {
+            TokenTree::Ident(id) if id == "fn" => {
+                let ghost = matches!(trees.get(i.wrapping_sub(1)), Some(TokenTree::Ident(p)) if p == "spec" || p == "proof");
+                if let (false, Some(TokenTree::Ident(name))) = (ghost, trees.get(i + 1)) {
+                    out.push(name.to_string());
+                }
+            }
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
+                // an inline module's items
+                let is_mod = matches!(trees.get(i.wrapping_sub(2)), Some(TokenTree::Ident(p)) if p == "mod");
+                if is_mod {
+                    verus_fns(g.stream(), out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Names of functions defined in a solution directory (every `.rs` file,
-/// recursively, including inline modules).
+/// recursively, including inline modules and `verus! { … }` blocks).
 pub fn solution_fns_in(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(dir: &Path, out: &mut Vec<String>) {
@@ -189,6 +230,7 @@ pub fn solution_fns_in(dir: &Path) -> Vec<String> {
                         collect(items, out);
                     }
                 }
+                syn::Item::Macro(m) if is_verus_macro(m) => verus_fns(m.mac.tokens.clone(), out),
                 _ => {}
             }
         }
@@ -340,6 +382,69 @@ pub struct Evidence {
 /// The Lean files `cargo djinn translate` regenerates in `<proofs>/<ns>/`.
 pub const GENERATED_LEAN: &[&str] = &["Spec.lean", "Obligations.lean", "Statements.lean", "Audit.lean", "Vocab.lean", "Tables.lean"];
 
+/// The verifier a crate's proofs are written for. `cargo djinn` and the build
+/// gate must agree on it: `report.toml` records it (`run.backend`), and the
+/// gate fingerprints the proof project of that backend.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Backend {
+    /// Lean 4 over the Aeneas model of the Rust (Charon, Aeneas, Lake): the
+    /// proof project is `<work_dir>/proofs`.
+    #[default]
+    Lean,
+    /// Verus, verifying the Rust itself: the proof project is `<work_dir>/verus`.
+    Verus,
+}
+
+impl Backend {
+    pub fn parse(s: &str) -> Option<Backend> {
+        match s.trim().to_lowercase().as_str() {
+            "lean" | "aeneas" | "lean4" => Some(Backend::Lean),
+            "verus" => Some(Backend::Verus),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Lean => "lean",
+            Backend::Verus => "verus",
+        }
+    }
+    /// The proof project's directory under the work directory.
+    pub fn project_dir_name(self) -> &'static str {
+        match self {
+            Backend::Lean => "proofs",
+            Backend::Verus => "verus",
+        }
+    }
+    /// The backend a report records (`run.backend`), `Lean` for reports
+    /// written before backends existed.
+    pub fn of_report(report_text: &str) -> Backend {
+        report_text
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("[[decl]]"))
+            .find_map(|l| l.trim().strip_prefix("backend").map(|r| r.trim_start().trim_start_matches('=').trim().trim_matches('"').to_string()))
+            .and_then(|b| Backend::parse(&b))
+            .unwrap_or(Backend::Lean)
+    }
+    /// Is `p`, inside the proof project `proofs`, skipped by the fingerprint:
+    /// the build cache, or a file `cargo djinn` regenerates on every verify?
+    /// Lean: `.lake/`, `<ns>/Code/`, `GENERATED_LEAN` in `<ns>/`. Verus:
+    /// `target/`, `.verus-log/`, and everything under `src/` except the
+    /// implementer's `src/proofs.rs` and `src/proofs/`.
+    pub fn is_generated(self, proofs: &Path, ns: &str, p: &Path) -> bool {
+        match self {
+            Backend::Lean => {
+                let lean = proofs.join(ns);
+                p == proofs.join(".lake") || p == lean.join("Code") || (p.parent() == Some(lean.as_path()) && GENERATED_LEAN.iter().any(|g| p.file_name().is_some_and(|n| n == *g)))
+            }
+            Backend::Verus => {
+                let src = proofs.join("src");
+                p == proofs.join("target") || p == proofs.join(".verus-log") || (p.starts_with(&src) && p != src && p != src.join("proofs.rs") && !p.starts_with(src.join("proofs")))
+            }
+        }
+    }
+}
+
 /// The evidence of a crate: every file under the solution directory, and every
 /// file of the Lean project `proofs` (lakefile, toolchain, manifest, root
 /// module, the implementer's proofs) except Lake's `.lake/` and what `cargo
@@ -350,12 +455,12 @@ pub const GENERATED_LEAN: &[&str] = &["Spec.lean", "Obligations.lean", "Statemen
 /// sources that pull in files from outside the solution directory
 /// (`#[path]`, `include!`, `include_str!`, `include_bytes!`; see
 /// `solution_escapes`).
-pub fn evidence(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> Result<Evidence, String> {
+pub fn evidence(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str, backend: Backend) -> Result<Evidence, String> {
     // paths in messages relative to the crate, as in the fingerprint
-    evidence_abs(crate_dir, solution, proofs, ns).map_err(|e| e.replace(&format!("{}/", crate_dir.display()), ""))
+    evidence_abs(crate_dir, solution, proofs, ns, backend).map_err(|e| e.replace(&format!("{}/", crate_dir.display()), ""))
 }
 
-fn evidence_abs(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> Result<Evidence, String> {
+fn evidence_abs(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str, backend: Backend) -> Result<Evidence, String> {
     fn walk(d: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
         let rd = match fs::read_dir(d) {
             Ok(rd) => rd,
@@ -391,14 +496,11 @@ fn evidence_abs(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> R
     }
     let mut files = Vec::new();
     walk(solution, &|_| false, &mut files)?;
-    let lean = proofs.join(ns);
-    let (lake, code) = (proofs.join(".lake"), lean.join("Code"));
-    // the solution may lie inside the Lean project (a `proofs` setting): not twice
-    walk(
-        proofs,
-        &|p: &Path| p == lake || p == code || p == solution || (p.parent() == Some(lean.as_path()) && GENERATED_LEAN.iter().any(|g| p.file_name().is_some_and(|n| n == *g))),
-        &mut files,
-    )?;
+    // the solution may lie inside the proof project (a `proofs` setting): not twice
+    walk(proofs, &|p: &Path| p == solution || backend.is_generated(proofs, ns, p), &mut files)?;
+    // the implementer's proof sources (Verus: Rust files) may not reach
+    // outside their directory either
+    let proof_src = proofs.join("src");
     let mut rel: Vec<(String, std::path::PathBuf)> = Vec::new();
     for f in files {
         let r = rel_slash(f.strip_prefix(crate_dir).unwrap_or(&f)).ok_or_else(|| format!("{}: the path is not UTF-8 or holds a newline", f.display()))?;
@@ -410,8 +512,12 @@ fn evidence_abs(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> R
     let mut h = Fnv::new();
     for (r, f) in &rel {
         let bytes = fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
-        if f.starts_with(solution) && f.extension().is_some_and(|x| x == "rs") {
+        // every file, whatever its name: rustc compiles a `#[path = "impl.txt"]`
+        // module too, so a file that is not Rust is refused here (not skipped)
+        if f.starts_with(solution) {
             solution_escapes(solution, f, &bytes)?;
+        } else if backend == Backend::Verus && f.starts_with(&proof_src) {
+            solution_escapes(&proof_src, f, &bytes)?;
         }
         h.eat(r.as_bytes());
         h.eat(&[0]);
@@ -430,8 +536,8 @@ fn evidence_abs(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> R
 }
 
 /// `evidence`'s record, or `invalid: <why>` (which no recomputation matches).
-pub fn evidence_record(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str) -> String {
-    match evidence(crate_dir, solution, proofs, ns) {
+pub fn evidence_record(crate_dir: &Path, solution: &Path, proofs: &Path, ns: &str, backend: Backend) -> String {
+    match evidence(crate_dir, solution, proofs, ns, backend) {
         Ok(e) => e.record,
         Err(e) => format!("invalid: {e}"),
     }
@@ -463,9 +569,12 @@ impl Fnv {
 /// `include_bytes!`) against the file's directory — or a directory below it,
 /// for a module inside inline modules — so a relative path that never climbs
 /// above `solution` from the file's directory stays inside on every reading.
-/// Fail closed: an absolute path, a path that is not a string literal (built
-/// by a macro, say), a renamed `include` (`use std::include as inc`) and a
-/// file that does not lex are refused.
+/// The target must also be an `.rs` file: every file under the solution is
+/// audited as Rust source, and a module named `impl.txt` would be compiled
+/// by rustc while looking like a note to a reader. Fail closed: an absolute
+/// path, a path that is not a string literal (built by a macro, say), a
+/// renamed `include` (`use std::include as inc`) and a file that does not
+/// lex are refused.
 pub fn solution_escapes(solution: &Path, file: &Path, bytes: &[u8]) -> Result<(), String> {
     let shown = file.display();
     let src = std::str::from_utf8(bytes).map_err(|_| format!("{shown}: not UTF-8"))?;
@@ -490,6 +599,9 @@ pub fn solution_escapes(solution: &Path, file: &Path, bytes: &[u8]) -> Result<()
             if d < 0 {
                 return Err(format!("{shown}: {what} \"{v}\" reaches outside {}; the verified solution must be self-contained", solution.display()));
             }
+        }
+        if !Path::new(&v).extension().is_some_and(|x| x == "rs") {
+            return Err(format!("{shown}: {what} \"{v}\" names a file that is not `.rs`; every file the solution pulls in must be a Rust source inside {} (every file there is audited as Rust)", solution.display()));
         }
         Ok(())
     };
@@ -607,7 +719,7 @@ mod evidence_tests {
         d
     }
     fn ev(d: &Path) -> Result<Evidence, String> {
-        evidence(d, &d.join("djinn/solution"), &d.join("djinn/proofs"), "NS")
+        evidence(d, &d.join("djinn/solution"), &d.join("djinn/proofs"), "NS", Backend::Lean)
     }
     fn rels(e: &Evidence) -> Vec<String> {
         e.record.lines().skip(1).map(|l| l.split_once(' ').unwrap().1.to_string()).collect()
@@ -656,10 +768,16 @@ mod evidence_tests {
     fn escapes() {
         let sol = Path::new("/c/djinn/solution");
         let ok = |f: &str, src: &str| solution_escapes(sol, &sol.join(f), src.as_bytes());
-        assert!(ok("mod.rs", "#[path = \"a/b.rs\"] mod b; const X: &str = include_str!(\"t.txt\");").is_ok());
-        assert!(ok("sub/mod.rs", "#[path = \"../x.rs\"] mod x; const T: &[u8] = include_bytes!(\"../t.bin\",);").is_ok());
+        assert!(ok("mod.rs", "#[path = \"a/b.rs\"] mod b; const X: &str = include_str!(\"t.rs\");").is_ok());
+        assert!(ok("sub/mod.rs", "#[path = \"../x.rs\"] mod x; const T: &[u8] = include_bytes!(\"../t.rs\",);").is_ok());
         assert!(ok("mod.rs", "fn f(path: u32) { let path = 1; }").is_ok());
         for (f, src) in [
+            // a module that is not an `.rs` file: compiled by rustc, but it would
+            // look like a note (and an audit keyed on the extension would skip it)
+            ("mod.rs", "#[path = \"impl.txt\"] mod inner;"),
+            ("mod.rs", "const X: &str = include_str!(\"t.txt\");"),
+            ("mod.rs", "const T: &[u8] = include_bytes!(\"t.bin\");"),
+            ("mod.rs", "#[path = \"inner\"] mod inner;"),
             ("mod.rs", "#[path = \"../outside.rs\"] mod o;"),
             ("mod.rs", "#[cfg_attr(all(), path = \"../../src/x.rs\")] mod o;"),
             ("sub/a.rs", "mod m { #[path = \"../../x.rs\"] mod o; }"),
@@ -680,6 +798,19 @@ mod evidence_tests {
         let d = tmp("escape");
         fs::write(d.join("djinn/solution/mod.rs"), "#[path = \"../../outside.rs\"] mod outside;\n").unwrap();
         assert!(ev(&d).unwrap_err().contains("reaches outside"));
+        let _ = fs::remove_dir_all(&d);
+        // a `.txt` module: refused for its name, and its content is scanned
+        // like any other file (an absolute `#[path]` out of the tree inside it)
+        let d = tmp("escape-txt");
+        fs::write(d.join("djinn/solution/mod.rs"), "#[path = \"impl.txt\"] mod inner;\n").unwrap();
+        fs::write(d.join("djinn/solution/impl.txt"), "pub fn f() -> u32 { 1 }\n").unwrap();
+        assert!(ev(&d).unwrap_err().contains("not `.rs`"), "{:?}", ev(&d));
+        fs::write(d.join("djinn/solution/mod.rs"), "mod inner;\n").unwrap();
+        fs::write(d.join("djinn/solution/impl.txt"), "#[path = \"/tmp/outside/evil.rs\"] mod ev;\n").unwrap();
+        assert!(ev(&d).unwrap_err().contains("reaches outside"), "{:?}", ev(&d));
+        // a file that is not Rust at all is refused too
+        fs::write(d.join("djinn/solution/impl.txt"), "just a note \"unterminated\n").unwrap();
+        assert!(ev(&d).unwrap_err().contains("cannot be read as Rust tokens"), "{:?}", ev(&d));
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -1,0 +1,15 @@
+[package]
+name = "clampdemo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+djinn = { path = "../../rust-djinn" }
+vstd = "=0.0.0-2026-10-25-0158"
+
+[package.metadata.djinn]
+backend = "verus"
+verus = "../../tools/verus/verus"
+spec = "src/spec.rs"
+namespace = "ClampDemo"
+bench = "bench::workload"

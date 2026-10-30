@@ -7,6 +7,9 @@ use djinn_syntax::Kind;
 use std::collections::HashMap;
 
 pub fn guide(cfg: &Config, lowered: &[Lowered], names: &HashMap<String, String>) -> String {
+    if cfg.is_verus() {
+        return crate::guide_verus::guide(cfg, lowered, names);
+    }
     let ns = &cfg.ns;
     let tn = crate::verify::parse_spec(cfg).map(|p| crate::verify::type_names(cfg, &p)).unwrap_or_default();
     let cx = crate::verify::emit_cx(cfg, lowered, names, &tn);

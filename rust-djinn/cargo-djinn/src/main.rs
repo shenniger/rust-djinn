@@ -1,4 +1,4 @@
-//! `cargo djinn` — the Djinn-on-Aeneas driver.
+//! `cargo djinn` — the Djinn driver (Lean/Aeneas or Verus, `--backend`).
 //!
 //! translate            emit the trusted Lean files and the harness guide
 //! verify [--jail DIR]  the whole gate; exit 0 iff PASS, 3 if only the specification
@@ -10,7 +10,7 @@
 //! guide                print GUIDE.md
 //! mcp --jail DIR       the MCP server the agents call (internal)
 
-use cargo_djinn::config::load_config;
+use cargo_djinn::config::{load_config_with, Backend};
 use cargo_djinn::{agent, bench, guide, mcp, optimize, smoke, status, verify};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,14 +20,18 @@ const SPEC_ONLY: u8 = 3;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: cargo djinn <command> [--manifest-path Cargo.toml]
+        "usage: cargo djinn <command> [--manifest-path Cargo.toml] [--backend lean|verus]
+  --backend lean|verus                         the verifier: Lean over the Aeneas model (default), or Verus;
+                                               also DJINN_BACKEND, [package.metadata.djinn] backend, else
+                                               the backend of the last report
   translate
   verify [--jail DIR]                          exit status: 0 PASS, 1 FAIL, 3 specification verified
                                                but some fn not implemented yet (not a PASS)
   implement [--agent codex|claude] [--background] [-B|--reimplement] [--yolo] [--model M] [--effort E]
             [--limit USD] [--max-budget-usd N] [--args \"...\"] [--prompt TEXT | --prompt-file F]
             (reuses existing solution/proofs and only completes what is missing; -B starts over)
-  status
+  status [--local]                             declarations implemented/proved per the last report, agent jobs, cost;
+                                               --local also runs the verifier on the files as they are (Verus: slow)
   clean                                        archive solution and proofs in .djinnscratch/backup/<time>/, remove derived files
   clean --restore [ID]                         bring a backup back (the latest, or ID from --list) and verify it
   clean --list                                 the backups and what they hold
@@ -53,6 +57,7 @@ fn main() -> ExitCode {
     let mut manifest = PathBuf::from("Cargo.toml");
     let mut cmd: Option<String> = None;
     let mut jail: Option<PathBuf> = None;
+    let mut backend: Option<Backend> = None;
     let mut opts = agent::Opts {
         agent: agent::Agent::Codex,
         model: None,
@@ -75,6 +80,7 @@ fn main() -> ExitCode {
     let mut bench_override: Option<String> = None;
     let mut restore: Option<Option<String>> = None;
     let mut list_backups = false;
+    let mut local = false;
     let mut i = 0;
     let next = |i: &mut usize, args: &[String]| -> Result<String, ExitCode> {
         *i += 1;
@@ -84,6 +90,16 @@ fn main() -> ExitCode {
         match args[i].as_str() {
             "--manifest-path" => manifest = PathBuf::from(match next(&mut i, &args) { Ok(v) => v, Err(c) => return c }),
             "--jail" => jail = Some(PathBuf::from(match next(&mut i, &args) { Ok(v) => v, Err(c) => return c })),
+            "--backend" => {
+                let v = match next(&mut i, &args) { Ok(v) => v, Err(c) => return c };
+                backend = match Backend::parse(&v) {
+                    Some(b) => Some(b),
+                    None => {
+                        eprintln!("--backend expects `lean` or `verus`");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--restore" => {
                 // an optional backup id (`20261004-235130`) may follow
                 let id = args.get(i + 1).filter(|a| a.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)).cloned();
@@ -93,6 +109,7 @@ fn main() -> ExitCode {
                 restore = Some(id);
             }
             "--list" => list_backups = true,
+            "--local" => local = true,
             "--agent" => {
                 opts.agent = match next(&mut i, &args).as_deref() {
                     Ok("claude") => agent::Agent::Claude,
@@ -145,7 +162,7 @@ fn main() -> ExitCode {
         }
         i += 1;
     }
-    let mut cfg = match load_config(&manifest) {
+    let mut cfg = match load_config_with(&manifest, backend) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -177,7 +194,7 @@ fn main() -> ExitCode {
         }
         Some("implement") => agent::implement(&cfg, opts, &bin),
         Some("status") => {
-            print!("{}", status::status_text(&cfg));
+            print!("{}", status::status_text_opts(&cfg, local));
             Ok(true)
         }
         Some("guide") => match verify::lower_spec(&cfg) {

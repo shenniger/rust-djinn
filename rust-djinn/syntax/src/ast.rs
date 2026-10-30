@@ -853,6 +853,9 @@ pub struct TypeDefs {
     pub ambient: std::collections::HashMap<String, Ambient>,
     /// Functions of the file a constraint cannot call, with the reason.
     pub ambient_errors: std::collections::HashMap<String, String>,
+    /// The `struct`s and `enum`s with `#[derive(Structural)]` (vstd's marker:
+    /// Verus relates `==` on them to the specification's equality).
+    pub structural: std::collections::HashSet<String>,
 }
 
 /// An ordinary Rust function of the specification file, callable from
@@ -866,6 +869,12 @@ pub struct Ambient {
     /// The item's tokens in canonical form (so that editing it marks every
     /// declaration that calls it as changed).
     pub source: String,
+    /// The item's tokens as `proc_macro2` prints them: re-parseable by `syn`
+    /// (the Verus backend translates the body).
+    pub tokens: String,
+    /// The item's tokens with their spans in the specification file, so that
+    /// a translation error can point at the construct it refuses.
+    pub item: proc_macro2::TokenStream,
 }
 
 #[derive(Clone, Debug)]

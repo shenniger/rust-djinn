@@ -37,10 +37,12 @@ The idea and the first implementation (on Dafny) are described in the paper:
 Specifications are `djinn! { … }` blocks in normal Rust crates; you can mix
 them freely with Rust functions. The generated implementations are plain Rust,
 compiled by `rustc`; the proofs are Lean 4 over the [Aeneas](https://github.com/AeneasVerif/aeneas)
-model of that Rust.
+model of that Rust — or, with `cargo djinn --backend verus`, [Verus](https://github.com/verus-lang/verus)
+annotations and proofs on the Rust itself.
 
 - **Install:** [docs/INSTALL.md](docs/INSTALL.md)
 - **First steps:** [docs/FIRST_STEPS.md](docs/FIRST_STEPS.md)
+- **The Verus backend:** [docs/VERUS.md](docs/VERUS.md)
 
 _Note: This is research code and far from production-ready. Use at your own peril._
 
@@ -151,12 +153,17 @@ cargo build   compiles solution/mod.rs only if the verification report matches t
    Rust signatures that the implementation must provide.
 2. `cargo djinn translate` lowers the specification to Lean (`Spec.lean`), runs
    Charon and Aeneas on the implementation to obtain its Lean model, and
-   generates the obligations.
+   generates the obligations. With `--backend verus` it lowers the
+   specification to Verus `spec fn`s instead and generates a verification
+   crate in which the obligations are pinned contracts and Verus verifies the
+   implementation directly ([docs/VERUS.md](docs/VERUS.md)).
 3. `cargo djinn implement` runs an agent in a jail with `cargo djinn verify`
    as a tool: Claude models through Claude Code, or GPT models through Codex,
    billed to whichever subscription you already have. It writes
-   `solution/mod.rs` and `Proofs.lean` until every obligation checks.
-4. `cargo djinn verify` has Lean check every obligation.
+   `solution/mod.rs` and `Proofs.lean` (with `--backend verus`: the solution
+   inside `verus! { … }` and `djinn/verus/src/proofs.rs`) until every
+   obligation checks.
+4. `cargo djinn verify` has Lean (or Verus) check every obligation.
 5. `cargo djinn bench` and `cargo djinn optimize` time a workload and
    hill-climb on it under the verifier.
 6. `rust-djinn-lsp` shows the proof status after every function in VS Code and
@@ -168,14 +175,15 @@ with Rust.
 ## This Repository
 
 ```
-docs/              INSTALL.md, FIRST_STEPS.md
+docs/              INSTALL.md, FIRST_STEPS.md, VERUS.md
 rust-djinn/        the tools (Cargo workspace)
-  syntax/            parser, checks, lowering to Lean, emitters
+  syntax/            parser, checks, lowering to Lean and to Verus, emitters
   macros/            the `djinn! { … }` macro
   cargo-djinn/       translate | verify | implement | status | smoke-test | bench | optimize
   lsp/               rust-djinn-lsp
 editors/           VS Code extension, Neovim config, a scripted LSP client
-example/           sort, clamp, sudoku, lz77 (from the paper), strmap, broken (what smoke-test catches)
+example/           sort, clamp, sudoku, lz77 (from the paper), gzip, calib, choice, strmap,
+                   broken (what smoke-test catches), clamp-verus (clamp, verified with the Verus backend)
 ```
 
 ## Status and limits
@@ -187,7 +195,10 @@ Currently, this can handle safe Rust over integers,
 slices, vectors, strings, structs, enums, `Option` and `Result`, and
 recursion. Calls into other crates need a model in the trusted library. We
 currently have models for parts of `std`, `core`, `alloc` and `memchr` but they
-are mostly vibe-coded and thus untrustworthy.
+are mostly vibe-coded and thus untrustworthy. The Verus backend relies on
+Verus's `vstd` instead (strings as UTF-8 bytes, `HashMap`s with integer or
+`bool` keys, bit-level methods through definitions in its vocabulary, ambient
+functions translated and checked by Verus; see [docs/VERUS.md](docs/VERUS.md)).
 
 Because rust-djinn cannot specify performance, it is prone to side-channel
 attacks. It is thus (conceptually) not suitable for cryptography.

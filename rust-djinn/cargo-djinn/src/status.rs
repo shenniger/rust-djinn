@@ -144,10 +144,28 @@ pub struct Usage {
     /// The agent reached the end of its turn (Claude's `result`, Codex's
     /// `turn.completed`); false for a log cut short by a signal or a crash.
     pub ended_turn: bool,
+    /// Live accounting of a Claude run still going: the input tokens are the
+    /// per-message snapshots (one per API message), the output tokens are
+    /// unknown until the `result` event — the counts and the estimate are a
+    /// lower bound.
+    pub input_only: bool,
 }
 
 impl Usage {
     pub fn line(&self) -> String {
+        if self.input_only {
+            return format!(
+                "tokens in {} (cached {}) / out not yet known, cost {} (input only, lower bound), tool calls {}, verifies {}",
+                self.input_tokens,
+                self.cached_tokens,
+                match self.est_cost_usd {
+                    Some(e) => format!("est.{} ≥ ${e:.2}", if self.est_approx { "≈" } else { "" }),
+                    None => "n/a".into(),
+                },
+                self.tool_calls,
+                self.verifies
+            );
+        }
         format!(
             "tokens in {} (cached {}) / out {}, cost {}, tool calls {}, verifies {}",
             self.input_tokens,
@@ -173,8 +191,13 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
     let verifies = &mut u.verifies;
     let tool_calls = &mut u.tool_calls;
     let last = &mut u.last_message;
-    // per-message usage, summed while a Claude run is still going
-    let (mut acc_in, mut acc_cached, mut acc_out) = (0u64, 0u64, 0u64);
+    // per-message usage while a Claude run is still going: one API message
+    // arrives as several `assistant` events sharing `message.id`, each with a
+    // snapshot of the message's usage so far — the last snapshot per id counts
+    // once (summing them counts the input several times over), and the
+    // per-event `output_tokens` is a partial count, so the output is unknown
+    // until the `result` event
+    let mut snapshots: HashMap<String, (u64, u64)> = HashMap::new();
     let mut have_result = false;
     let mut codex_thread: Option<String> = None;
     for line in text.lines() {
@@ -198,11 +221,12 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
                 u.model = Some(m.to_string());
             }
             let us = &v["message"]["usage"];
-            acc_in += us["input_tokens"].as_u64().unwrap_or(0)
-                + us["cache_read_input_tokens"].as_u64().unwrap_or(0)
-                + us["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            acc_cached += us["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            acc_out += us["output_tokens"].as_u64().unwrap_or(0);
+            let input = us["input_tokens"].as_u64().unwrap_or(0) + us["cache_read_input_tokens"].as_u64().unwrap_or(0) + us["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            let cached = us["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            if input > 0 {
+                let id = v["message"]["id"].as_str().map(|s| s.to_string()).unwrap_or_else(|| format!("#{}", snapshots.len()));
+                snapshots.insert(id, (input, cached));
+            }
             for c in v["message"]["content"].as_array().into_iter().flatten() {
                 if c["type"] == "tool_use" {
                     *tool_calls += 1;
@@ -284,10 +308,11 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
             u.output_tokens += us["output_tokens"].as_u64().unwrap_or(0);
         }
     }
-    if !have_result && u.input_tokens == 0 && acc_in > 0 {
-        u.input_tokens = acc_in;
-        u.cached_tokens = acc_cached;
-        u.output_tokens = acc_out;
+    if !have_result && u.input_tokens == 0 && !snapshots.is_empty() {
+        u.input_tokens = snapshots.values().map(|(i, _)| i).sum();
+        u.cached_tokens = snapshots.values().map(|(_, c)| c).sum();
+        u.output_tokens = 0;
+        u.input_only = true;
     }
     if let Some(t) = &codex_thread {
         if let Some((i, c, o, m)) = codex_rollout_usage(t) {
@@ -369,9 +394,10 @@ pub fn job_elapsed(job: &Job) -> u64 {
 pub enum ObState {
     /// proved and audited by the last `verify`
     Verified,
-    /// elaborates without errors or `sorry` in a local type-check (not yet verified)
+    /// passes a local check without errors or placeholders (`sorry`, the TODO
+    /// marker) — not yet verified
     Local,
-    /// a theorem exists but has errors or a `sorry`
+    /// a theorem / proof fn exists but has errors or a placeholder
     Drafted,
     /// no theorem of that name
     Missing,
@@ -567,7 +593,7 @@ pub fn views_text(cfg: &Config, report: Option<&Report>, local: Option<(&Path, &
         },
     };
     let local_fns = local.map(|(sol, _)| crate::verify::solution_fns_in(sol));
-    let local_obs = local.and_then(|(_, proofs)| local_states(&cfg.ns, proofs, 180));
+    let local_obs = local.and_then(|(_, proofs)| if cfg.is_verus() { crate::verify_verus::local_states(cfg, proofs, 180) } else { local_states(&cfg.ns, proofs, 180) });
     decls
         .into_iter()
         .map(|d| {
@@ -647,15 +673,27 @@ pub fn verdict(r: &Report) -> String {
 /// The solution and proof files on disk against the report's fingerprint
 /// (what the build gate checks).
 pub fn evidence_check(cfg: &Config, r: &Report) -> djinn_syntax::project::EvidenceCheck {
-    let current = djinn_syntax::project::evidence(&cfg.crate_dir, &cfg.solution_dir(), &cfg.proofs, &cfg.ns);
+    let current = djinn_syntax::project::evidence(&cfg.crate_dir, &cfg.solution_dir(), &cfg.proof_root(), &cfg.ns, cfg.backend);
     djinn_syntax::project::check_evidence(&r.evidence, &current)
 }
 
 pub fn status_text(cfg: &Config) -> String {
+    status_text_opts(cfg, false)
+}
+
+/// `cargo djinn status [--local]`. With `local`, the verifier is run on the
+/// project as it is and the implementer's proofs are classified (`local_states`);
+/// without, the report's states are shown. The Lean backend still assesses
+/// locally when there is no report yet (a type-check of `Proofs.lean`); the
+/// Verus backend never does without `--local`: Verus on the whole crate can
+/// take minutes.
+pub fn status_text_opts(cfg: &Config, local: bool) -> String {
     let mut s = String::new();
     let report = Report::load(cfg);
     s.push_str(&format!("{} ({})\n", cfg.crate_name, cfg.specs_display()));
-    s.push_str("legend: ✓ ok (accepted by verify)   ✓· checks locally, not yet verified   ~ drafted (sorry or error)   – missing   ✓? verified before a change\n");
+    s.push_str(&format!("backend: {}\n", cfg.backend.name()));
+    s.push_str(&format!("legend: ✓ ok (accepted by verify)   ✓· checks locally, not yet verified   ~ drafted ({} or error)   – missing   ✓? verified before a change\n", if cfg.is_verus() { "TODO" } else { "sorry" }));
+    let here = (cfg.solution_dir(), cfg.proof_root());
     match &report {
         Some(r) => {
             s.push_str(&format!(
@@ -668,14 +706,23 @@ pub fn status_text(cfg: &Config) -> String {
             if let Some(m) = evidence_check(cfg, r).message() {
                 s.push_str(&format!("  {m}\n"));
             }
-            s.push_str(&render(&views(cfg, Some(r), None)));
+            if local {
+                s.push_str("  (with a local assessment of the files as they are)\n");
+                s.push_str(&render(&views(cfg, Some(r), Some((&here.0, &here.1)))));
+            } else {
+                s.push_str(&render(&views(cfg, Some(r), None)));
+            }
             for e in r.errors.iter().take(6) {
                 s.push_str(&format!("    {e}\n"));
             }
         }
-        None => {
+        None if local || !cfg.is_verus() => {
             s.push_str("verified state: none yet (run `cargo djinn verify`); local assessment of the crate:\n");
-            s.push_str(&render(&views(cfg, None, Some((&cfg.solution_dir(), &cfg.proofs)))));
+            s.push_str(&render(&views(cfg, None, Some((&here.0, &here.1)))));
+        }
+        None => {
+            s.push_str("verified state: none yet (run `cargo djinn verify`); not assessed between verifies (`cargo djinn status --local` runs Verus on the project as it is):\n");
+            s.push_str(&render(&views(cfg, None, None)));
         }
     }
     if let Some(o) = crate::optimize::OptimizeLog::load(cfg) {
@@ -727,7 +774,7 @@ pub fn status_text(cfg: &Config) -> String {
         }
         if matches!(job_state(j), JobState::Running) && crate::jail::proofs_in(cfg, &j.jail).exists() {
             s.push_str("    current work in the jail (type-checked just now):\n");
-            let v = views(cfg, report.as_ref(), Some((&crate::jail::sol_in(cfg, &j.jail), &crate::jail::proofs_in(cfg, &j.jail))));
+            let v = if cfg.is_verus() && !local { views(cfg, report.as_ref(), None) } else { views(cfg, report.as_ref(), Some((&crate::jail::sol_in(cfg, &j.jail), &crate::jail::proofs_in(cfg, &j.jail)))) };
             for line in render(&v).lines() {
                 s.push_str(&format!("  {line}\n"));
             }
@@ -766,8 +813,8 @@ pub fn diff_views(old: &[DeclView], new: &[DeclView]) -> Vec<String> {
             let msg = match (prev, *st) {
                 (_, ObState::Verified) => format!("{}: {label} ok", n.name),
                 (_, ObState::Local) => format!("{}: {label} now passing (local check, not yet verified)", n.name),
-                (ObState::Missing | ObState::Unknown, ObState::Drafted) => format!("{}: {label} drafted (sorry or errors remain)", n.name),
-                (ObState::Local | ObState::Verified, ObState::Drafted) => format!("{}: {label} BROKEN (errors or sorry)", n.name),
+                (ObState::Missing | ObState::Unknown, ObState::Drafted) => format!("{}: {label} drafted (errors remain, or no proof yet)", n.name),
+                (ObState::Local | ObState::Verified, ObState::Drafted) => format!("{}: {label} BROKEN (errors, or the proof was removed)", n.name),
                 (_, ObState::Missing) => format!("{}: {label} removed", n.name),
                 _ => continue,
             };
@@ -806,9 +853,35 @@ mod tests {
     }
 
     #[test]
+    fn live_usage_counts_each_message_once() {
+        let dir = std::env::temp_dir().join(format!("djinn-status-live-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        // one API message, streamed as two `assistant` events sharing `message.id`
+        // with snapshots of its usage; then a second message
+        let live = r#"{"type":"system","subtype":"init","model":"claude-x"}
+{"type":"assistant","message":{"id":"msg_1","model":"claude-x","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":0,"output_tokens":5},"content":[{"type":"text","text":"a"}]}}
+{"type":"assistant","message":{"id":"msg_1","model":"claude-x","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":0,"output_tokens":40},"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"assistant","message":{"id":"msg_2","model":"claude-x","usage":{"input_tokens":20,"cache_read_input_tokens":2000,"cache_creation_input_tokens":0,"output_tokens":7},"content":[{"type":"text","text":"b"}]}}"#;
+        fs::write(&log, live).unwrap();
+        let u = summarize_log(&log, None);
+        assert_eq!(u.input_tokens, 1010 + 2020);
+        assert_eq!(u.cached_tokens, 3000);
+        assert!(u.input_only && u.output_tokens == 0, "{u:?}");
+        assert!(u.line().contains("lower bound"), "{}", u.line());
+        assert_eq!(u.tool_calls, 1);
+        // the result event is authoritative
+        fs::write(&log, format!("{live}\n{}", r#"{"type":"result","result":"done","usage":{"input_tokens":30,"cache_read_input_tokens":3000,"output_tokens":500},"total_cost_usd":0.5}"#)).unwrap();
+        let u = summarize_log(&log, None);
+        assert!(!u.input_only);
+        assert_eq!((u.input_tokens, u.output_tokens), (3030, 500));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn spec_only_verdict() {
         let d = |name: &str, implemented: bool| crate::verify::DeclStatus { name: name.into(), kind: "func".into(), implemented, obligations: vec![], tokens: String::new(), uses: vec![], ok: implemented, weak: false };
-        let mut r = Report { time: 0, duration_secs: 0, pass: true, stage: "done".into(), obligations: Default::default(), declarations: vec![d("f", true), d("g", false)], errors: vec![], log_tail: vec![], evidence: String::new() };
+        let mut r = Report { time: 0, duration_secs: 0, pass: true, stage: "done".into(), obligations: Default::default(), declarations: vec![d("f", true), d("g", false)], errors: vec![], log_tail: vec![], evidence: String::new(), backend: Default::default() };
         assert_eq!(verdict(&r), "SPECIFICATION VERIFIED (not implemented yet: g)");
         r.declarations.pop();
         assert_eq!(verdict(&r), "PASS");

@@ -279,8 +279,8 @@ directory (or with `--manifest-path`). The ones you will use:
 | `cargo djinn status` | one line per function with its obligations, then the agent runs on this crate with their token use and cost |
 | `cargo djinn smoke-test [--only NAME]` | the Z3 checks the editor runs as you type, with every counterexample; `example/broken` shows each kind of finding |
 | `cargo djinn implement [--agent codex\|claude] [--limit USD]` | runs the agent until every obligation checks; reuses what already passes, `-B` starts over, `--background` returns at once and `status` follows the job |
-| `cargo djinn verify` | the whole chain: `cargo build`, Charon, Aeneas, the Lean build, the axiom audit; every run writes `djinn/report.toml` |
-| `cargo djinn translate` | regenerates the Lean specification, obligations and the agent's guide without verifying |
+| `cargo djinn verify` | the whole chain: `cargo build`, Charon, Aeneas, the Lean build, the axiom audit (with `--backend verus`: `cargo build`, the audit of the implementer's files, Verus — see [VERUS.md](VERUS.md)); every run writes `djinn/report.toml` |
+| `cargo djinn translate` | regenerates the Lean specification, obligations and the agent's guide without verifying (with `--backend verus`: the Verus relations, the pinned obligations, the mirrored modules and the guide; new proof stubs are appended to `proofs.rs`, untouched ones refreshed) |
 | `cargo djinn bench` / `optimize` | see above |
 | `cargo djinn clean [--list \| --restore [ID]]` | sets the implementation and proofs aside under `.djinnscratch/backup/`, lists the backups, or brings one back and verifies it |
 | `cargo djinn guide` | prints the guide the agent is given |

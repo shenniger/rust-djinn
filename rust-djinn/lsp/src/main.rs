@@ -235,6 +235,10 @@ fn decls_of(text: &str) -> Result<Vec<(String, String, usize, usize)>, djinn_syn
 }
 
 fn find_theorem_line(file: &Path, decl: &str) -> Option<u32> {
+    if file.extension().is_some_and(|e| e == "rs") {
+        let text = std::fs::read_to_string(file).ok()?;
+        return text.lines().position(|l| l.contains(&format!("fn {decl}_")) || l.contains(&format!("fn {decl}("))).map(|n| n as u32);
+    }
     let text = std::fs::read_to_string(file).ok()?;
     text.lines().position(|l| l.starts_with(&format!("theorem {decl}."))).map(|n| n as u32)
 }
@@ -592,8 +596,8 @@ fn execute(ctx: &Ctx, command: &str, args: &[Value]) -> Result<(), String> {
     match command {
         "djinn.openObligations" | "djinn.openProofs" | "djinn.openGuide" => {
             let file = match command {
-                "djinn.openObligations" => cfg.lean_dir().join("Obligations.lean"),
-                "djinn.openProofs" => cfg.lean_dir().join("Proofs.lean"),
+                "djinn.openObligations" => cfg.obligations_file(),
+                "djinn.openProofs" => cfg.proof_main(),
                 _ => cfg.guide_path(),
             };
             if !file.exists() {

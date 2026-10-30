@@ -1295,6 +1295,20 @@ fn table_literal(e: &syn::Expr) -> Option<Vec<String>> {
 }
 
 /// `struct`, `enum`, literal `const` and `fn` items of a specification file.
+/// Does a `#[derive(…)]` list name `Structural` (vstd's marker trait)?
+fn derives_structural(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().filter(|a| a.path().is_ident("derive")).any(|a| {
+        let mut found = false;
+        let _ = a.parse_nested_meta(|m| {
+            if m.path.segments.last().is_some_and(|s| s.ident == "Structural") {
+                found = true;
+            }
+            Ok(())
+        });
+        found
+    })
+}
+
 pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
     let mut t = TypeDefs::default();
     for item in &file.items {
@@ -1311,6 +1325,9 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                         syn::Fields::Named(n) => n.named.iter().map(|f| convert_type(&f.ty).map(|(t, _)| (f.ident.as_ref().map(|i| i.to_string()), t))).collect::<Result<Vec<_>>>()?,
                     };
                     variants.push(VariantDef { name: v.ident.to_string(), fields });
+                }
+                if derives_structural(&e.attrs) {
+                    t.structural.insert(e.ident.to_string());
                 }
                 t.enums.insert(e.ident.to_string(), EnumDef { name: e.ident.to_string(), variants });
             }
@@ -1330,6 +1347,9 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                             }
                         }
                     }
+                }
+                if derives_structural(&s.attrs) {
+                    t.structural.insert(s.ident.to_string());
                 }
                 t.structs.insert(s.ident.to_string(), StructDef { name: s.ident.to_string(), fields });
             }
@@ -1377,7 +1397,7 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                             t
                         }
                     };
-                    Ok(Ambient { name: name.clone(), params, ret, span, source: source.clone() })
+                    Ok(Ambient { name: name.clone(), params, ret, span, source: source.clone(), tokens: f.to_token_stream().to_string(), item: f.to_token_stream() })
                 })();
                 match reason {
                     Ok(a) => {

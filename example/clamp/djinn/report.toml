@@ -6,9 +6,9 @@
 # Commit it with solution/ and proofs/.
 
 [run]
-time = "2026-10-21 23:43:36 UTC"
-unix_time = 1792626216
-duration_secs = 30
+time = "2026-10-30 04:06:35 UTC"
+unix_time = 1793333195
+duration_secs = 92
 pass = true
 stage = "done"
 errors = []
@@ -20,6 +20,7 @@ efd65b1e4bca3f5f djinn/proofs/ClampDemo.lean
 012c7315c5b0d374 djinn/proofs/lakefile.lean
 8e8349acb539bb60 djinn/proofs/lean-toolchain
 ddf7e81c3dc72006 djinn/solution/mod.rs"""
+backend = "lean"
 
 [[decl]]
 name = "clamp"

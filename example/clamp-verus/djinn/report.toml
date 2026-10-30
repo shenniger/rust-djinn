@@ -1,0 +1,71 @@
+# Written by `cargo djinn` after every verify. Per declaration: its tokens as
+# verified, what it uses, and the status of each obligation. The `djinn!`
+# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
+# used declaration's) differ from this file, and the whole crate when the
+# solution or proof files differ from `run.evidence` (edit them, verify again).
+# Commit it with solution/ and proofs/.
+
+[run]
+time = "2026-10-30 04:01:08 UTC"
+unix_time = 1793332868
+duration_secs = 74
+pass = true
+stage = "done"
+errors = []
+evidence = """
+fnv1a64v2:3879e2c31e793123:2
+b47431266fe0636a djinn/solution/mod.rs
+c9f4b17c1582fbb6 djinn/verus/src/proofs.rs"""
+backend = "verus"
+
+[[decl]]
+name = "clamp"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( lo < = hi ) ] pub fn clamp ( x : i32 , lo : i32 , hi : i32 ) - > r : i32 { lo < = r < = hi ; x < lo = > r = = lo ; x > hi = > r = = hi ; lo < = x < = hi = > r = = x ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "count_negative"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn count_negative ( v : & [ i32 ] ) - > r : usize { r = = v . iter () . filter ( | y | y < 0 ) . count () ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "min"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn min ( a : i32 , b : i32 ) - > r : i32 { r < = a ; r < = b ; r = = a | | r = = b ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "max"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn max ( a : i32 , b : i32 ) - > r : i32 { r > = a ; r > = b ; r = = a | | r = = b ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"

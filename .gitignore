@@ -6,3 +6,4 @@ target
 tools
 *.swp
 corpora
+.verus-log

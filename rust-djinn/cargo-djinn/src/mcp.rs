@@ -7,11 +7,16 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-fn tools() -> Value {
+fn tools(cfg: &Config) -> Value {
+    let verify_desc = if cfg.is_verus() {
+        format!("Run the Djinn verifier on your current solution and proofs: syncs the solution directory and {} from this jail into the real crate, then cargo build → audit of your files → regenerate the trusted files → verus --no-cheating on the whole verification crate. Returns PASS or the failing stage with the errors. Also refreshes the generated files in the jail. Takes about a minute on a small specification and 5-15 minutes on a large one (a failing function burns its whole resource limit first): iterate with ./verus-check and call this when that is clean.", cfg.proof_main_rel())
+    } else {
+        "Run the Djinn verifier on your current solution and proofs: syncs the solution directory and Proofs.lean from this jail into the real crate, then cargo build → charon → aeneas → regenerate trusted Lean → lake build → axiom audit. Returns PASS or the failing stage with the errors. Also refreshes the generated files in the jail (Code/, Spec.lean, Obligations.lean). Takes 10 s to a few minutes.".to_string()
+    };
     json!([
         {
             "name": "verify",
-            "description": "Run the Djinn verifier on your current solution and proofs: syncs the solution directory and Proofs.lean from this jail into the real crate, then cargo build → charon → aeneas → regenerate trusted Lean → lake build → axiom audit. Returns PASS or the failing stage with the errors. Also refreshes the generated files in the jail (Code/, Spec.lean, Obligations.lean). Takes 10 s to a few minutes.",
+            "description": verify_desc,
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false }
         },
@@ -62,7 +67,7 @@ pub fn serve(cfg: &Config, jail: &Path) {
                 );
             }
             "ping" => reply(&mut out, id, json!({})),
-            "tools/list" => reply(&mut out, id, json!({ "tools": tools() })),
+            "tools/list" => reply(&mut out, id, json!({ "tools": tools(cfg) })),
             "tools/call" => {
                 let name = req["params"]["name"].as_str().unwrap_or("");
                 let (text, is_error) = match name {
