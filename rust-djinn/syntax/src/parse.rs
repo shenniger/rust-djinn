@@ -102,7 +102,8 @@ pub fn parse_decl(kind: Kind, tokens: TokenStream) -> Result<Decl> {
                     other => return Err(Error::new(other.span(), "parameters must be plain identifiers")),
                 };
                 let (ty, mut_ref) = convert_type(&pt.ty)?;
-                params.push(Param { name, ty, mut_ref, span: pt.span() });
+                let shared_ref = matches!(&*pt.ty, syn::Type::Reference(r) if r.mutability.is_none() && !matches!(&*r.elem, syn::Type::Slice(_)) && !matches!(&*r.elem, syn::Type::Path(p) if p.path.is_ident("str")));
+                params.push(Param { name, ty, mut_ref, shared_ref, span: pt.span() });
             }
             syn::FnArg::Receiver(r) => return Err(Error::new(r.span(), "`self` parameters are not supported")),
         }

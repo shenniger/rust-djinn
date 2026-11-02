@@ -29,6 +29,8 @@ pub struct Lowered {
     pub outputs: Vec<(String, RType)>,
     /// Implementation parameters as Aeneas sees them: `(v, Vec I32)`.
     pub impl_params: Vec<(String, RType)>,
+    /// The implementation parameters taken by shared reference (`&State`).
+    pub impl_shared: Vec<String>,
     pub pre: Vec<String>,
     pub spec: Vec<String>,
     pub ensures: Vec<String>,
@@ -269,6 +271,7 @@ pub fn lower_with(d: &Decl, decls: &HashMap<String, DeclInfo>, types: &TypeDefs,
         inputs: d.inputs(),
         outputs: d.outputs(),
         impl_params: d.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect(),
+        impl_shared: d.params.iter().filter(|p| p.shared_ref).map(|p| p.name.clone()).collect(),
         pre,
         spec,
         ensures,

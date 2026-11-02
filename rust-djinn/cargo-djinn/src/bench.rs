@@ -246,6 +246,14 @@ fn main() {{
     Ok(dir)
 }
 
+/// The start of `measure`'s error when the runner ran past DJINN_BENCH_TIMEOUT.
+pub const TIMED_OUT: &str = "the benchmark ran past its time limit";
+
+/// DJINN_BENCH_TIMEOUT: the longest a workload run may take, in seconds.
+pub fn timeout() -> Option<f64> {
+    std::env::var("DJINN_BENCH_TIMEOUT").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0)
+}
+
 /// Build the runner in release mode and run it: `jobs` points at a time.
 pub fn measure(cfg: &Config, min_time: f64, batches: usize, jobs: usize, log: &mut dyn FnMut(&str)) -> Result<Measurement, String> {
     // no batches would make a batch infinitely long (the runner calibrates to
@@ -269,16 +277,33 @@ pub fn measure(cfg: &Config, min_time: f64, batches: usize, jobs: usize, log: &m
         if npoints > 1 { format!(" at each of {npoints} points, {} at a time", jobs.min(npoints)) } else { String::new() }
     ));
     let exe = dir.join("target").join("release").join("djinn-bench-runner");
-    let out = Command::new(&exe)
+    let (stdout, stderr) = (dir.join("runner.out"), dir.join("runner.err"));
+    let mut child = Command::new(&exe)
         .arg(format!("{min_time}"))
         .arg(format!("{batches}"))
         .arg(format!("{jobs}"))
-        .output()
+        .stdout(fs::File::create(&stdout).map_err(|e| e.to_string())?)
+        .stderr(fs::File::create(&stderr).map_err(|e| e.to_string())?)
+        .spawn()
         .map_err(|e| format!("runner: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("the workload runner failed: {}", String::from_utf8_lossy(&out.stderr)));
+    // DJINN_BENCH_TIMEOUT (seconds): the runner is killed when it runs longer
+    let limit = timeout();
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().map_err(|e| format!("runner: {e}"))? {
+            break st;
+        }
+        if limit.is_some_and(|l| start.elapsed().as_secs_f64() > l) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{TIMED_OUT} ({:.0} s, DJINN_BENCH_TIMEOUT): the runner was stopped", limit.unwrap()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    if !status.success() {
+        return Err(format!("the workload runner failed: {}", fs::read_to_string(&stderr).unwrap_or_default()));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = fs::read_to_string(&stdout).map_err(|e| format!("runner output: {e}"))?;
     // the report is the runner's last line: the workload may print too
     let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
     let json: serde_json::Value = serde_json::from_str(last.trim()).map_err(|e| format!("runner output: {e}: {text}"))?;

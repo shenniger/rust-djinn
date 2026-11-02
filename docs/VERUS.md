@@ -14,6 +14,22 @@ last verify; else Lean. The build gate (`cargo build`) always judges by the
 report's backend, so a crate verified with Verus compiles against its Verus
 report whatever the environment says.
 
+## One crate, two backends
+
+A crate can hold an implementation for each backend. Lean's lives in
+`djinn/solution/`, `djinn/proofs/` and `djinn/report.toml`; Verus's in
+`djinn/verus/`: `djinn/verus/solution/` (the implementer's Rust),
+`djinn/verus/report.toml` and the verification crate `djinn/verus/src/`.
+`src/lib.rs` includes the solution with `djinn::solution!();`, which reads
+it from the directory of the backend the build is for. That backend is
+`DJINN_BACKEND` (`cargo djinn` sets it for everything it runs, so a
+`--backend verus` command builds and benches the Verus solution), else the
+metadata's `backend`, else the backend whose report exists (Lean's first),
+else Lean: a plain `cargo build` of a crate with both compiles the Lean
+solution, `DJINN_BACKEND=verus cargo build` the Verus one. The build gate
+checks the solution it compiles against that backend's report. The Verus
+backend's job records, jails and logs are in `.djinnscratch/verus/`.
+
 ## What the crate needs
 
 ```toml
@@ -51,7 +67,8 @@ djinn/verus/src/obligations.rs  trusted: the proof obligations, pinned
 djinn/verus/src/<module>.rs     trusted: a mirror of each specification module
 djinn/verus/src/proofs.rs       the implementer's: one `proof fn` per obligation
 djinn/verus/src/proofs/         the implementer's helper modules
-djinn/solution/                 the implementer's Rust, as with Lean
+djinn/verus/solution/           the implementer's Rust (Lean's is djinn/solution/)
+djinn/verus/report.toml         the verifier's report
 ```
 
 **Relations.** Every `fn` and `rel` becomes two `open spec fn`s over the

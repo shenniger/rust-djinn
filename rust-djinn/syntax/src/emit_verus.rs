@@ -96,6 +96,9 @@ pub fn relations_rs_with(cx: &EmitCx, decls: &[Lowered], ambient: &[crate::ambie
             s.push('\n');
         }
     }
+    // the user types compared by contents (`djinn_eq_T` exists)
+    let eq_names: Vec<String> = decls.iter().flat_map(|d| d.helpers.iter().map(|(n, _)| n.clone())).collect();
+    let has_eq = |t: &str| eq_names.iter().any(|n| *n == eq_fn_name(t.rsplit("::").next().unwrap_or(t)));
     for d in decls {
         s.push_str(&format!("// ---- {} {}\n\n", d.kind.word(), d.name));
         let ins = binders(&d.inputs, cx.names);
@@ -111,6 +114,12 @@ pub fn relations_rs_with(cx: &EmitCx, decls: &[Lowered], ambient: &[crate::ambie
         } else {
             format!("{pre_app} &&\n    {body}")
         };
+        // a choice function is, as in Lean, a function of its arguments'
+        // contents: content-equal arguments give equal results (without it a
+        // `spec_fn` over a struct holding a `Vec` could tell apart two values
+        // `djinn_eq` makes equal, and `unambiguous` would be unprovable)
+        let respects: Vec<String> = d.choices.iter().filter_map(|(c, t)| choice_respects(c, t, &has_eq)).collect();
+        let body = if respects.is_empty() { body } else { format!("{body} &&\n    {}", respects.join(" &&\n    ")) };
         let rel = if d.choices.is_empty() { "spec" } else { "body" };
         let mut params = ins.clone();
         params.extend(choice_binders(&d.choices));
@@ -394,7 +403,9 @@ pub fn impl_stub(cx: &EmitCx, d: &Lowered) -> Option<String> {
     }
     let is_mut = |n: &str| d.outputs.iter().any(|(o, _)| o == n);
     let ret = d.outputs.iter().find(|(n, _)| !d.impl_params.iter().any(|(p, _)| p == n));
-    let params: Vec<String> = d.impl_params.iter().map(|(n, t)| format!("{}: {}{}", verus_ident(n), if is_mut(n) { "&mut " } else { "" }, exec_type(t, cx.names))).collect();
+    // a `&T` parameter is `&T` here too (the solution, compiled by the real
+    // crate, takes it so); in the contract a shared reference is its value
+    let params: Vec<String> = d.impl_params.iter().map(|(n, t)| format!("{}: {}{}", verus_ident(n), if is_mut(n) { "&mut " } else if d.impl_shared.contains(n) { "&" } else { "" }, exec_type(t, cx.names))).collect();
     // a `&mut v` parameter is `old(v)` on entry and `final(v)` on exit in a
     // contract, each of type `&mut T`: viewed by `@` (a sequence, a map) as it
     // stands, dereferenced (`*old(v)`) for a value whose view is a `match` or
@@ -403,7 +414,11 @@ pub fn impl_stub(cx: &EmitCx, d: &Lowered) -> Option<String> {
         RType::Seq(..) | RType::Map(..) => view_term(&format!("{f}({})", verus_ident(n)), t, cx.names),
         _ => view_term(&format!("*{f}({})", verus_ident(n)), t, cx.names),
     };
-    let in_views: Vec<String> = d.impl_params.iter().map(|(n, t)| if is_mut(n) { mut_term("old", n, t) } else { view_term(&verus_ident(n), t, cx.names) }).collect();
+    let in_views: Vec<String> = d
+        .impl_params
+        .iter()
+        .map(|(n, t)| if is_mut(n) { mut_term("old", n, t) } else if d.impl_shared.contains(n) { view_term(&format!("(*{})", verus_ident(n)), t, cx.names) } else { view_term(&verus_ident(n), t, cx.names) })
+        .collect();
     let mut out_views: Vec<String> = Vec::new();
     if let Some((n, t)) = ret {
         out_views.push(view_term(&verus_ident(n), t, cx.names));
@@ -631,3 +646,85 @@ mod tests {
         assert_eq!(call_args(&obs[0]), "lo, hi, k, o1, o2");
     }
 }
+
+/// The parameter lists of a curried `spec_fn` type, outermost first:
+/// `spec_fn(A, B) -> spec_fn(C) -> R` gives `[[A, B], [C]]`.
+fn spec_fn_levels(ty: &str) -> Vec<Vec<String>> {
+    let mut levels = Vec::new();
+    let mut rest = ty.trim();
+    while let Some(r) = rest.strip_prefix("spec_fn(") {
+        let mut depth = 1i32;
+        let mut end = None;
+        for (i, ch) in r.char_indices() {
+            match ch {
+                '(' | '<' | '[' => depth += 1,
+                ')' | '>' | ']' if !(ch == '>' && r[..i].ends_with('-')) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(e) = end else { break };
+        let inner = &r[..e];
+        let mut params = Vec::new();
+        let (mut d, mut start) = (0i32, 0usize);
+        for (i, ch) in inner.char_indices() {
+            match ch {
+                '(' | '<' | '[' => d += 1,
+                ')' | ']' => d -= 1,
+                '>' if !inner[..i].ends_with('-') => d -= 1,
+                ',' if d == 0 => {
+                    params.push(inner[start..i].trim().to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if !inner[start..].trim().is_empty() {
+            params.push(inner[start..].trim().to_string());
+        }
+        levels.push(params);
+        rest = r[e + 1..].trim_start().strip_prefix("->").unwrap_or("").trim();
+    }
+    levels
+}
+
+/// `c` respects content equality: for arguments of a user type compared by
+/// contents (`has_eq`), `djinn_eq`-equal arguments give equal results.
+/// `None` when no argument has such a type.
+fn choice_respects(c: &str, ty: &str, has_eq: &dyn Fn(&str) -> bool) -> Option<String> {
+    let levels = spec_fn_levels(ty);
+    let mut binders = Vec::new();
+    let mut eqs = Vec::new();
+    let (mut app_a, mut app_b) = (c.to_string(), c.to_string());
+    for (i, params) in levels.iter().enumerate() {
+        let (mut aa, mut bb) = (Vec::new(), Vec::new());
+        for (j, t) in params.iter().enumerate() {
+            let x = format!("{RESERVED_V}_{i}_{j}");
+            if has_eq(t) {
+                let name = t.rsplit("::").next().unwrap_or(t);
+                binders.push(format!("{x}a: {t}"));
+                binders.push(format!("{x}b: {t}"));
+                eqs.push(format!("{}({x}a, {x}b)", eq_fn_name(name)));
+                aa.push(format!("{x}a"));
+                bb.push(format!("{x}b"));
+            } else {
+                binders.push(format!("{x}: {t}"));
+                aa.push(x.clone());
+                bb.push(x);
+            }
+        }
+        app_a = format!("{app_a}({})", aa.join(", "));
+        app_b = format!("{app_b}({})", bb.join(", "));
+    }
+    if eqs.is_empty() {
+        return None;
+    }
+    Some(format!("(forall|{}| #![trigger {app_a}, {app_b}] {} ==> {app_a} == {app_b})", binders.join(", "), eqs.join(" && ")))
+}
+
+const RESERVED_V: &str = "djinn_r";

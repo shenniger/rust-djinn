@@ -43,19 +43,18 @@ pub(crate) fn project() -> Option<Project> {
         Some(toml::Value::Array(a)) => Some(a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()),
         _ => None,
     };
-    // the backend: the report's, else the metadata's, else Lean (the report
-    // is what the gate judges by, so its backend is the one that applies)
-    let report_path = dir.join(&work).join("report.toml");
-    let backend = match fs::read_to_string(&report_path) {
-        Ok(t) => Backend::of_report(&t),
-        Err(_) => get("backend").and_then(|b| Backend::parse(&b)).unwrap_or(Backend::Lean),
-    };
+    // the backend the build is for: `DJINN_BACKEND` (cargo djinn exports it),
+    // the metadata's, else the one whose report exists (Backend::resolve);
+    // each backend has its own solution and report
+    let verus_dir = dir.join(&work).join(get("verus_dir").unwrap_or_else(|| "verus".into()));
+    let backend = Backend::resolve(std::env::var("DJINN_BACKEND").ok().as_deref(), get("backend").as_deref(), &dir.join(&work), &verus_dir).unwrap_or(Backend::Lean);
+    let report_path = backend.report_path(&dir.join(&work), &verus_dir);
     let proofs = match backend {
         Backend::Lean => match get("proofs") {
             Some(p) => dir.join(p),
             None => dir.join(&work).join("proofs"),
         },
-        Backend::Verus => dir.join(&work).join(get("verus_dir").unwrap_or_else(|| "verus".into())),
+        Backend::Verus => verus_dir.clone(),
     };
     let name = toml.get("package").and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or_default();
     let ns = djinn_syntax::project::namespace(get("namespace").as_deref(), name);
@@ -65,9 +64,9 @@ pub(crate) fn project() -> Option<Project> {
         ns,
         dir: dir.clone(),
         specs: djinn_syntax::project::spec_files(&dir, manual.as_deref()).into_iter().map(|f| f.path).collect(),
-        solution: dir.join(&work).join("solution"),
+        solution: backend.solution_dir(&dir.join(&work), &verus_dir),
+        report_rel: report_path.strip_prefix(&dir).unwrap_or(&report_path).to_string_lossy().into_owned(),
         report: report_path,
-        report_rel: format!("{work}/report.toml"),
         in_jail: meta.get("in_jail").and_then(|v| v.as_bool()).unwrap_or(false),
     })
 }

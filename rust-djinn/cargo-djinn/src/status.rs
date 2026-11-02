@@ -198,6 +198,8 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
     // per-event `output_tokens` is a partial count, so the output is unknown
     // until the `result` event
     let mut snapshots: HashMap<String, (u64, u64)> = HashMap::new();
+    // Oh My Pi's per-message usage is exact per message, so it is summed
+    let (mut acc_in, mut acc_cached, mut acc_out) = (0u64, 0u64, 0u64);
     let mut have_result = false;
     let mut codex_thread: Option<String> = None;
     for line in text.lines() {
@@ -275,6 +277,53 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
                 u.output_tokens = us["output_tokens"].as_u64().unwrap_or(0);
             }
         }
+        // Oh My Pi (`omp --mode json`): one `message_end` per message (`turn_end` repeats the
+        // assistant message, so it is not counted), usage per assistant message, `agent_end`
+        // when the run finishes its turn
+        if v["type"] == "session" && v["version"].is_string() {
+            u.api_error = None;
+        }
+        if v["type"] == "message_end" && v["message"]["role"] == "assistant" {
+            let m = &v["message"];
+            if let Some(model) = m["model"].as_str() {
+                u.model = Some(model.to_string());
+            }
+            let us = &m["usage"];
+            let cached = us["cacheRead"].as_u64().unwrap_or(0);
+            acc_in += us["input"].as_u64().unwrap_or(0) + cached + us["cacheWrite"].as_u64().unwrap_or(0);
+            acc_cached += cached;
+            acc_out += us["output"].as_u64().unwrap_or(0);
+            if let Some(c) = us["cost"]["total"].as_f64() {
+                if c > 0.0 {
+                    u.cost_usd = Some(u.cost_usd.unwrap_or(0.0) + c);
+                }
+            }
+            u.turns += 1;
+            for c in m["content"].as_array().into_iter().flatten() {
+                if c["type"] == "toolCall" {
+                    *tool_calls += 1;
+                    let n = c["name"].as_str().unwrap_or("");
+                    let cmd = c["arguments"]["command"].as_str().or_else(|| c["arguments"]["cmd"].as_str()).unwrap_or("");
+                    if n.contains("verify") || cmd.contains("verify") {
+                        *verifies += 1;
+                    }
+                } else if c["type"] == "text" {
+                    if let Some(t) = c["text"].as_str() {
+                        if !t.trim().is_empty() {
+                            *last = t.to_string();
+                        }
+                    }
+                }
+            }
+            if m["stopReason"] == "error" {
+                u.api_error = Some(m["errorMessage"].as_str().unwrap_or("omp: the model call failed").to_string());
+            } else {
+                u.api_error = None;
+            }
+        }
+        if v["type"] == "agent_end" {
+            u.ended_turn = true;
+        }
         // Codex JSONL
         if v["type"] == "item.completed" || v["type"] == "item.started" {
             let it = &v["item"];
@@ -313,6 +362,11 @@ pub fn summarize_log(path: &PathBuf, model_hint: Option<&str>) -> Usage {
         u.cached_tokens = snapshots.values().map(|(_, c)| c).sum();
         u.output_tokens = 0;
         u.input_only = true;
+    }
+    if !have_result && u.input_tokens == 0 && acc_in > 0 {
+        u.input_tokens = acc_in;
+        u.cached_tokens = acc_cached;
+        u.output_tokens = acc_out;
     }
     if let Some(t) = &codex_thread {
         if let Some((i, c, o, m)) = codex_rollout_usage(t) {

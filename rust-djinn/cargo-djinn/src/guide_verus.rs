@@ -421,6 +421,12 @@ decides how to drive it:
   fails burns its whole resource limit before it is reported. Run it in the
   background or with a timeout and read the file:
   `timeout 900 ./verus-check > check.out 2>&1`, then `grep -n "^error" check.out`.
+- Verus checks the functions of one module one after another and separate
+  modules in parallel. A function that fails on its resource limit takes
+  20–35 s, so a module full of unfinished proofs is slow: example/vp8's
+  `proofs.rs` with 70 unproved stubs took 31 minutes, its other modules
+  under 1.5 minutes each. Functions in helper modules (`proofs/…`) are
+  checked alongside each other.
 - Narrow it while you work on one lemma: `./verus-check --verify-only-module
   proofs` verifies only `proofs.rs` (a helper module is `proofs::huff`);
   `./verus-check --verify-only-module proofs --verify-function 'lemma_*'`

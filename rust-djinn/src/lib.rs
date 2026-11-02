@@ -19,4 +19,4 @@
 //! The constraint language is documented in DESIGN.md. Lean obligations
 //! are produced by `cargo djinn`, not by these macros. `func!` and `rel!`
 //! remain as single-item forms.
-pub use djinn_macros::{djinn, func, rel};
+pub use djinn_macros::{djinn, func, rel, solution};

@@ -87,7 +87,7 @@ pub fn aeneas_type(t: &RType, names: &TypeNames) -> String {
             SeqKind::Vec => format!("alloc.vec.Vec {}", paren(aeneas_type(e, names))),
             SeqKind::Array(n) => format!("Aeneas.Std.Array {} {}#usize", paren(aeneas_type(e, names)), n),
         },
-        RType::Map(k, v) => format!("std.collections.hash.map.HashMap {} {} std.hash.random.RandomState Global", paren(aeneas_type(k, names)), paren(aeneas_type(v, names))),
+        RType::Map(k, v) => format!("std.collections.hash.map.HashMap {} {} std.hash.random.RandomState alloc.alloc.Global", paren(aeneas_type(k, names)), paren(aeneas_type(v, names))),
         RType::Option(e) => format!("Option {}", paren(aeneas_type(e, names))),
         RType::Result(a, b) => format!("core.result.Result {} {}", paren(aeneas_type(a, names)), paren(aeneas_type(b, names))),
         RType::Unit => "Unit".into(),

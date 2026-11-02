@@ -58,9 +58,24 @@ pub fn width_verus(signed: bool, bits: u32) -> String {
     }
 }
 
-/// A Rust identifier as a Verus identifier.
-pub fn verus_ident(n: &str) -> String {
+/// A struct field's name as a Verus identifier: a raw identifier where it
+/// is a Verus keyword (fields are mirrored verbatim, so never renamed).
+pub fn verus_field(n: &str) -> String {
     if VERUS_KEYWORDS.contains(&n) {
+        format!("r#{n}")
+    } else {
+        n.to_string()
+    }
+}
+
+/// A Rust identifier (a binding) as a Verus identifier.
+pub fn verus_ident(n: &str) -> String {
+    // `int` and `nat` are Verus's types (unit structs of `builtin`): even as
+    // `r#nat` a binding of that name is read as the struct pattern, so the
+    // name is replaced by a reserved one (example/tiff's `swapped(…) -> nat`)
+    if n == "int" || n == "nat" {
+        format!("{RESERVED}_{n}")
+    } else if VERUS_KEYWORDS.contains(&n) {
         format!("r#{n}")
     } else {
         n.to_string()
@@ -565,6 +580,11 @@ fn find_trigger_excluding(body: &str, x: &str, inner: &[String], exclude: &[Stri
         if !mentions_var(cand, x) || ids.iter().any(|w| inner.iter().any(|n| n == w)) {
             continue;
         }
+        // Verus refuses a trigger with a comparison, a boolean connective or
+        // a conditional inside (`f(x, (s >= 7))`, `g(x * (if c { a } else { b }))`)
+        if !trigger_allowed(cand) {
+            continue;
+        }
         if has_arith(cand) {
             if with_arith.is_none() {
                 with_arith = Some(cand.to_string());
@@ -580,6 +600,16 @@ fn find_trigger_excluding(body: &str, x: &str, inner: &[String], exclude: &[Stri
 #[cfg(test)]
 fn has_trigger(body: &str, x: &str, inner: &[String]) -> bool {
     find_trigger_excluding(body, x, inner, &[]).is_some_and(|t| !has_arith(&t))
+}
+
+/// Can `t` stand in a trigger: no comparison (`<`, `<=`, `>`, `>=`, `==`,
+/// `!=`), no `&&`, `||`, `==>`, `!`, and no `if`, `match` or `let` (Verus:
+/// "triggers cannot contain inequalities / `if`/`else` / …"). The generated
+/// terms put spaces around binary operators, so `Seq<u8>` is no comparison.
+fn trigger_allowed(t: &str) -> bool {
+    const BAD: [&str; 12] = [" < ", " <= ", " > ", " >= ", " == ", " != ", " && ", " || ", " ==> ", " <==> ", "(!", "(if "];
+    let words = idents(t);
+    !BAD.iter().any(|b| t.contains(b)) && !t.starts_with('!') && !words.iter().any(|w| ["if", "match", "let"].contains(w))
 }
 
 fn has_arith(s: &str) -> bool {
@@ -780,7 +810,12 @@ pub fn lower_with(d: &Decl, decls: &HashMap<String, DeclInfo>, types: &TypeDefs,
     }
     let mut decreases = Vec::new();
     for e in &d.decreases {
-        decreases.push(l.num(e)?);
+        // clamped at 0 as the Lean backend's `termination_by (e).toNat`: Verus
+        // checks that an `int` measure stays non-negative at the recursive
+        // call, which the Lean measure does not ask (lz4's `stream` recurses
+        // at a `j` known only to exceed `i`)
+        let m = l.num(e)?;
+        decreases.push(format!("(if {m} > 0 {{ {m} }} else {{ 0 }})"));
     }
     l.guards.clear();
     l.pre_scope = false;
@@ -837,6 +872,7 @@ pub fn lower_with(d: &Decl, decls: &HashMap<String, DeclInfo>, types: &TypeDefs,
         inputs: d.inputs(),
         outputs: d.outputs(),
         impl_params: d.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect(),
+        impl_shared: d.params.iter().filter(|p| p.shared_ref).map(|p| p.name.clone()).collect(),
         pre,
         spec,
         ensures,
@@ -2128,7 +2164,12 @@ impl<'a> L<'a> {
                     (SType::Int | SType::Of(RType::Int { .. }) | SType::Of(RType::MathInt), RType::Int { .. }) => (self.as_num(t, &ty), SType::Int),
                     (SType::Of(RType::Char), RType::Int { .. }) => (format!("({t} as int)"), SType::Int),
                     (SType::Of(RType::Int { signed: false, bits: 8 }), RType::Char) => (format!("({t} as char)"), SType::Of(RType::Char)),
-                    (SType::Int, RType::Char) => (format!("(({t} as u8) as char)"), SType::Of(RType::Char)),
+                    (SType::Int, RType::Char) => {
+                        // Lean's `Char.ofNat` and this `as u8` agree only on 0..=255:
+                        // a well-formedness guard keeps the meanings equal
+                        self.guards.push(format!("0 <= {t} && {t} <= 255"));
+                        (format!("(({t} as u8) as char)"), SType::Of(RType::Char))
+                    }
                     _ => return err("unsupported cast: integers cast to integers (no overflow in the specification), `char as u32`, `u8 as char`".into()),
                 }
             }
@@ -2136,6 +2177,10 @@ impl<'a> L<'a> {
             ExprKind::Bin(op, l, r) if op.is_arith() => {
                 let a = self.num(l)?;
                 let b = self.num(r)?;
+                // two bare literals give Verus nothing to infer their type
+                // from (`(2654435761 + 2246822519) % pow(2, 32)` became a
+                // `nat` against pow's `int`): they are integers
+                let (a, b) = if is_literal(&a) && is_literal(&b) { (format!("{a}int"), format!("{b}int")) } else { (a, b) };
                 let sym = match op {
                     BinOp::Add => "+",
                     BinOp::Sub => "-",
@@ -2332,7 +2377,8 @@ impl<'a> L<'a> {
                     let (st, et) = self.seq(s)?;
                     (format!("crate::vocab::last({st})"), opt(et))
                 }
-                Method::Abs(x) => (format!("vstd::math::abs({})", self.num(x)?), SType::Int),
+                // vstd's `abs` is a `nat`; the specification's is an integer
+                Method::Abs(x) => (format!("(vstd::math::abs({}) as int)", self.num(x)?), SType::Int),
                 Method::Min(a, b) => (format!("vstd::math::min({}, {})", self.num(a)?, self.num(b)?), SType::Int),
                 Method::Max(a, b) => (format!("vstd::math::max({}, {})", self.num(a)?, self.num(b)?), SType::Int),
                 Method::Pow(a, n) => {
@@ -2663,12 +2709,19 @@ mod tests {
     }
 
     #[test]
+    fn triggers_skip_comparisons_and_conditionals() {
+        assert!(!super::trigger_allowed("f(x, ((st.state as int) >= 7))"));
+        assert!(!super::trigger_allowed("g(((m.v as int) * (if c == 0 { a } else { b })), q)"));
+        assert!(super::trigger_allowed("h(s, (i + 4), Seq::<u8>::empty())"));
+    }
+
+    #[test]
     fn recursion_is_chained_and_matches_render() {
         let src = "pub enum Token { Lit(u8), Match { dist: u32, len: u32 } }\ndjinn! { pub fn toklen(t: Token) -> n: u32 { match t { Token::Lit(_) => n == 1, Token::Match { len, .. } => n == len, } }\n\
             #[decreases(ts.len())] pub rel encoded(ts: &[Token]) -> m: int { if ts.is_empty() { m == 0; } else { m == encoded(ts[..ts.len() - 1]) + toklen(ts[ts.len() - 1]); } } }";
         let l = lowered(src);
         assert_eq!(l[0].spec[0], "(match t { Token::Lit(_) => (n as int) == 1, Token::Match { len: len_1, .. } => n == len_1 })");
-        assert!(l[1].decreases == vec!["(ts.len() as int)".to_string()]);
+        assert_eq!(l[1].decreases, vec!["(if (ts.len() as int) > 0 { (ts.len() as int) } else { 0 })".to_string()]);
         assert!(l[1].spec[0].contains("encoded_spec(crate::vocab::slice(ts, 0, ((ts.len() as int) - 1)), v_call0)"), "{}", l[1].spec[0]);
         assert!(l[1].spec[0].contains("toklen_spec(ts[((ts.len() as int) - 1)], v_call1)"), "{}", l[1].spec[0]);
     }

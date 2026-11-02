@@ -244,23 +244,32 @@ pub fn frontier_verdict(old: &Measurement, new: &Measurement, required: f64, siz
 
 /// The verdict for independent points (`Measurement::independent_points`:
 /// no sizes, or all equal — a frontier would collapse to the fastest point):
-/// no point slower beyond its bar, and some point faster by at least its bar.
-/// A point's bar is `threshold`, or the spread of its batches in either
-/// measurement if larger (with `noisy`; without, the threshold alone).
+/// the summed time improves by at least the bar, and no point is slower by
+/// more than `POINT_LOSS` (or its noise, if larger). The bar is `threshold`,
+/// or with `noisy` the time-weighted spread of the points' batches if
+/// larger (so a short noisy point cannot veto a gain on the long ones).
+pub const POINT_LOSS: f64 = 0.15;
 pub fn points_verdict(old: &Measurement, new: &Measurement, threshold: f64, noisy: bool) -> Result<f64, String> {
-    let mut best: Option<f64> = None;
+    let (mut ot, mut nt, mut on, mut nn) = (0.0, 0.0, 0.0, 0.0);
     for op in &old.points {
         let Some(np) = new.points.iter().find(|p| p.id == op.id) else { return Err(format!("point {} is missing", op.id)) };
-        let bar = if noisy { threshold.max(op.noise()).max(np.noise()) } else { threshold };
+        let cap = if noisy { POINT_LOSS.max(op.noise()).max(np.noise()) } else { POINT_LOSS };
         let gain = 1.0 - np.median_ns / op.median_ns;
-        if gain < -bar {
-            return Err(format!("slower at point {}: {} → {} ({:+.1}%, allowed {:.1}%)", op.id, fmt_ns(op.median_ns), fmt_ns(np.median_ns), -gain * 100.0, bar * 100.0));
+        if gain < -cap {
+            return Err(format!("slower at point {}: {} → {} ({:+.1}%, allowed {:.1}%)", op.id, fmt_ns(op.median_ns), fmt_ns(np.median_ns), -gain * 100.0, cap * 100.0));
         }
-        if gain >= bar {
-            best = Some(best.map_or(gain, |b: f64| b.max(gain)));
-        }
+        ot += op.median_ns;
+        nt += np.median_ns;
+        on += op.median_ns * op.noise();
+        nn += np.median_ns * np.noise();
     }
-    best.ok_or_else(|| "not faster beyond noise and threshold at any point".to_string())
+    let bar = if noisy { threshold.max(on / ot).max(nn / nt) } else { threshold };
+    let gain = 1.0 - nt / ot;
+    if gain >= bar {
+        Ok(gain)
+    } else {
+        Err(format!("not faster in total: {} → {} ({:+.1}%, needed {:.1}%)", fmt_ns(ot), fmt_ns(nt), -gain * 100.0, bar * 100.0))
+    }
 }
 
 /// The verdict on `new` against `current`: `Ok(improvement)` or `Err(why)`.
@@ -456,15 +465,15 @@ you changed and why, and the timing you observed: it becomes the history shown t
         backend = if cfg.is_verus() { "Verus" } else { "Aeneas" },
         verifier = if cfg.is_verus() { "Verus" } else { "Aeneas" },
         model = if cfg.is_verus() { String::new() } else { format!(" (the Aeneas model of your new code appears in `{}/{}/Code/` after a `verify`)", cfg.proofs_rel(), cfg.ns) },
-        goal = if current.independent_points() { "FASTER — at some point of the workload, and slower at none" } else if current.is_multi() { "BETTER — faster at every compression ratio, or denser at every speed" } else { "FASTER" },
+        goal = if current.independent_points() { "FASTER — in the summed time of the workload's points" } else if current.is_multi() { "BETTER — faster at every compression ratio, or denser at every speed" } else { "FASTER" },
         timing = if current.is_multi() { format!("{}\n\n```\n{}```", current.line(), current.table()) } else { current.line() },
         rule = if current.independent_points() {
             format!(
-                "every point is judged on its own (the points' sizes do not trade off against time): no point \
-runs more than {pct:.1}% slower (or its measured noise, if larger) and at least one point runs at least \
-{pct:.1}% faster (or its noise, if larger) on a re-measurement by the harness ({thr:.0}% threshold).",
+                "the summed time of the points (the sizes do not trade off against time) must run at least \
+{pct:.1}% faster (or the points' measured noise, if larger) on a re-measurement by the harness, and no \
+single point may run more than {loss:.0}% slower.",
                 pct = opts.threshold * 100.0,
-                thr = opts.threshold * 100.0
+                loss = POINT_LOSS * 100.0
             )
         } else if current.is_multi() {
             format!(
@@ -676,14 +685,30 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<u8, String> {
         // (2) it must be better beyond noise and threshold: faster, for a
         // multi-point workload a better trade-off curve, for independent
         // points faster somewhere and slower nowhere
-        let mut m = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
+        let mut m = match bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say) {
+            Err(e) if e.starts_with(bench::TIMED_OUT) => {
+                attempt.verdict = format!("slower: {e}");
+                eprintln!("cycle {cycle}: {}", attempt.verdict);
+                log.attempts.push(attempt);
+                log.save(cfg);
+                revert(cfg, "the benchmark ran past its time limit")?;
+                continue;
+            }
+            r => r?,
+        };
         let mut verdict = judge(&current, &m, opts.threshold, size_threshold(&opts), true);
         if verdict.is_err() && judge(&current, &m, opts.threshold, size_threshold(&opts), false).is_ok() {
             // better than the threshold, not than the noise: measure again,
             // longer, instead of rejecting a gain that load blurred
             eprintln!("cycle {cycle}: borderline ({}) — re-measuring with twice the batches", verdict.as_ref().unwrap_err());
-            m = bench::measure(cfg, opts.min_time * 2.0, opts.batches * 2, opts.jobs, &mut say)?;
-            verdict = judge(&current, &m, opts.threshold, size_threshold(&opts), true);
+            // past the time limit, the first measurement's verdict stands
+            match bench::measure(cfg, opts.min_time * 2.0, opts.batches * 2, opts.jobs, &mut say) {
+                Err(e) if e.starts_with(bench::TIMED_OUT) => eprintln!("cycle {cycle}: the re-measurement {e}; keeping the first"),
+                r => {
+                    m = r?;
+                    verdict = judge(&current, &m, opts.threshold, size_threshold(&opts), true);
+                }
+            }
         }
         attempt.ns = Some(m.median_ns);
         attempt.points = point_list(&m);
@@ -811,15 +836,24 @@ mod verdict_tests {
 
     #[test]
     fn equal_sizes_judge_every_point() {
-        // the frontier of equal sizes is the fastest point alone: a slower
-        // other point must still reject
+        // the frontier of equal sizes is the fastest point alone: a much
+        // slower other point must still reject
         let old = m(&[(1, Some(0), &[10.0; 5]), (2, Some(0), &[100.0; 5])]);
         let new = m(&[(1, Some(0), &[8.0; 5]), (2, Some(0), &[150.0; 5])]);
         assert!(old.independent_points());
         assert!(judge(&old, &new, 0.03, 0.005, true).unwrap_err().contains("slower at point 2"));
-        let new = m(&[(1, None, &[8.0; 5]), (2, None, &[100.5; 5])]);
         let old = m(&[(1, None, &[10.0; 5]), (2, None, &[100.0; 5])]);
-        assert!((judge(&old, &new, 0.03, 0.005, true).unwrap() - 0.2).abs() < 1e-9);
+        let new = m(&[(1, None, &[8.0; 5]), (2, None, &[90.0; 5])]);
+        assert!((judge(&old, &new, 0.03, 0.005, true).unwrap() - 12.0 / 110.0).abs() < 1e-9);
+        // a short point a little slower does not veto a gain in total
+        let new = m(&[(1, None, &[11.0; 5]), (2, None, &[90.0; 5])]);
+        assert!(judge(&old, &new, 0.03, 0.005, true).is_ok());
+        // but beyond the per-point cap it does
+        let new = m(&[(1, None, &[12.0; 5]), (2, None, &[80.0; 5])]);
+        assert!(judge(&old, &new, 0.03, 0.005, true).unwrap_err().contains("slower at point 1"));
+        // a big gain at the short point alone is not enough in total
+        let new = m(&[(1, None, &[8.0; 5]), (2, None, &[99.0; 5])]);
+        assert!(judge(&old, &new, 0.03, 0.005, true).unwrap_err().contains("not faster in total"));
         // nothing faster beyond the threshold
         let new = m(&[(1, None, &[9.9; 5]), (2, None, &[99.0; 5])]);
         assert!(judge(&old, &new, 0.03, 0.005, true).is_err());

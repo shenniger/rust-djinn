@@ -30,6 +30,27 @@ pub fn djinn(input: TokenStream) -> TokenStream {
     }
 }
 
+/// `djinn::solution!();` in `src/lib.rs`: the `solution` module, read from
+/// the solution directory of the backend the build is for (`djinn/solution`
+/// for Lean, `djinn/verus/solution` for Verus; `Backend::resolve`), with
+/// `#[forbid(unsafe_code)]`. `DJINN_BACKEND` is also read through
+/// `option_env!`, so that changing it recompiles the crate.
+#[proc_macro]
+pub fn solution(_input: TokenStream) -> TokenStream {
+    let dir = match gate::project() {
+        Some(p) => p.solution,
+        None => std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default()).join("djinn").join("solution"),
+    };
+    let path = dir.join("mod.rs").to_string_lossy().into_owned();
+    quote! {
+        #[forbid(unsafe_code)]
+        #[path = #path]
+        pub mod solution;
+        const _: Option<&str> = option_env!("DJINN_BACKEND");
+    }
+    .into()
+}
+
 #[proc_macro]
 pub fn func(input: TokenStream) -> TokenStream {
     expand(Kind::Func, input)

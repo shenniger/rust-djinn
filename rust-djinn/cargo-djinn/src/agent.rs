@@ -12,6 +12,8 @@ use std::process::{Command, Stdio};
 pub enum Agent {
     Claude,
     Codex,
+    /// Oh My Pi (`omp`, github.com/can1357/oh-my-pi): any provider its models file configures
+    Omp,
 }
 
 impl Agent {
@@ -19,6 +21,7 @@ impl Agent {
         match self {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
+            Agent::Omp => "omp",
         }
     }
 }
@@ -457,8 +460,14 @@ fn agent_argv(opts: &Opts, jail: &Path, bin: &Path, manifest: &Path) -> Vec<Stri
                 format!("mcp_servers.djinn.command={}", toml_str(&bin.to_string_lossy())),
                 s("-c"),
                 format!(
-                    "mcp_servers.djinn.args=[{},{},{},{},{}]",
+                    "mcp_servers.djinn.args=[{},{},{},{},{},{},{}]",
                     toml_str("mcp"),
+                    // the backend explicitly: Codex starts the server without
+                    // this process's environment (DJINN_BACKEND), and the real
+                    // crate may hold a report of the other backend (`Config`
+                    // loading set DJINN_BACKEND in this process)
+                    toml_str("--backend"),
+                    toml_str(&std::env::var("DJINN_BACKEND").unwrap_or_else(|_| "lean".into())),
                     toml_str("--jail"),
                     toml_str(&jail.to_string_lossy()),
                     toml_str("--manifest-path"),
@@ -485,6 +494,38 @@ fn agent_argv(opts: &Opts, jail: &Path, bin: &Path, manifest: &Path) -> Vec<Stri
             }
             a.extend(opts.extra_args.iter().cloned());
             a.push(s("-"));
+            a
+        }
+        Agent::Omp => {
+            // Oh My Pi in print mode with its JSON event stream; the prompt arrives on stdin
+            // (run.sh feeds PROMPT.md), the djinn MCP server comes from the jail's `.mcp.json`,
+            // which omp reads as project MCP config. omp has no sandbox and no per-command
+            // allowlist: tool calls are auto-approved (`--approval-mode yolo`), so the jail's
+            // protection is the sync-back rule (only the solution and proofs are taken back),
+            // not a restricted shell. A verify runs Charon, Aeneas and lake: MCP calls may take
+            // 30 minutes. The provider, key and profile are omp's own configuration: pass
+            // `--args "--profile NAME"` to use an isolated profile.
+            let mut a = vec![
+                s("env"),
+                s("OMP_MCP_TIMEOUT_MS=1800000"),
+                s("omp"),
+                s("-p"),
+                s("--mode"),
+                s("json"),
+                s("--cwd"),
+                jail.to_string_lossy().into_owned(),
+                s("--approval-mode"),
+                s("yolo"),
+                s("--session-dir"),
+                jail.join("omp-sessions").to_string_lossy().into_owned(),
+                s("--no-title"),
+            ];
+            if let Some(m) = &opts.model {
+                a.extend([s("--model"), m.clone()]);
+            }
+            // omp's thinking levels: off, minimal, low, medium, high, xhigh, max, auto
+            a.extend([s("--thinking"), opts.effort.clone().unwrap_or_else(|| s("high"))]);
+            a.extend(opts.extra_args.iter().cloned());
             a
         }
     }

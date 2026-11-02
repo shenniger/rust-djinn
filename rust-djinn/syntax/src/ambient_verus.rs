@@ -40,7 +40,7 @@
 //! with a message at the construct, never guessed.
 
 use crate::ast::*;
-use crate::lower_verus::{ambient_spec_name, exec_type, verus_ident};
+use crate::lower_verus::{ambient_spec_name, exec_type, verus_field, verus_ident};
 use crate::types::TypeNames;
 use proc_macro2::Span;
 use quote::ToTokens;
@@ -543,7 +543,7 @@ impl<'a> Tr<'a> {
                             let fty = fty.clone();
                             let v = self.expr(&f.expr, Some(&fty))?;
                             let v = self.coerce(v, &fty)?;
-                            fs.push(format!("{}: {}", verus_ident(&fname), v.text));
+                            fs.push(format!("{}: {}", verus_field(&fname), v.text));
                         }
                         return Ok(T { text: format!("{}::{name} {{ {} }}", self.tpath(&en), fs.join(", ")), ty: RType::Named(en) });
                     }
@@ -560,7 +560,7 @@ impl<'a> Tr<'a> {
                     let fty = fty.clone();
                     let v = self.expr(&f.expr, Some(&fty))?;
                     let v = self.coerce(v, &fty)?;
-                    fs.push(format!("{}: {}", verus_ident(&fname), v.text));
+                    fs.push(format!("{}: {}", verus_field(&fname), v.text));
                 }
                 Ok(T { text: format!("{} {{ {} }}", self.tpath(&name), fs.join(", ")), ty: RType::Named(name) })
             }
@@ -574,7 +574,7 @@ impl<'a> Tr<'a> {
                     _ => return self.err("a tuple field"),
                 };
                 let Some((_, fty)) = sd.fields.iter().find(|(n, _)| *n == fname) else { return self.err(&format!("the unknown field `{fname}` of `{sn}`")) };
-                Ok(T { text: format!("{}.{}", paren(&x.text), verus_ident(&fname)), ty: fty.clone() })
+                Ok(T { text: format!("{}.{}", paren(&x.text), verus_field(&fname)), ty: fty.clone() })
             }
             E::MethodCall(m) => self.method(m, want),
             E::Return(_) => self.err("an early `return` (one that is not the last statement of the body): write the body as one expression, `if c { a } else { b }`, whose value is the result"),
@@ -1127,7 +1127,7 @@ impl<'a> Tr<'a> {
                     let fty = fty.clone();
                     let sub = self.pattern(&f.pat, &fty)?;
                     // `Variant { x }` binds `x` (the shorthand stays a shorthand)
-                    subs.push(if sub == verus_ident(&fname) { sub } else { format!("{}: {sub}", verus_ident(&fname)) });
+                    subs.push(if sub == verus_ident(&fname) && sub == verus_field(&fname) { sub } else { format!("{}: {sub}", verus_field(&fname)) });
                 }
                 if ps.rest.is_some() {
                     subs.push("..".into());

@@ -8,7 +8,7 @@ use crate::ast::{Decl, Program};
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Tokens as one canonical line: every token separated by a single space,
 /// groups with their delimiters. Independent of the token source (the
@@ -416,6 +416,34 @@ impl Backend {
             Backend::Verus => "verus",
         }
     }
+    /// The implementer's Rust: `<work>/solution` for Lean, `<verus_dir>/solution`
+    /// for Verus, so that one crate can hold an implementation for each backend.
+    pub fn solution_dir(self, work: &Path, verus_dir: &Path) -> PathBuf {
+        match self {
+            Backend::Lean => work.join("solution"),
+            Backend::Verus => verus_dir.join("solution"),
+        }
+    }
+    /// The verifier's report, next to the solution it certifies:
+    /// `<work>/report.toml` for Lean, `<verus_dir>/report.toml` for Verus.
+    pub fn report_path(self, work: &Path, verus_dir: &Path) -> PathBuf {
+        match self {
+            Backend::Lean => work.join("report.toml"),
+            Backend::Verus => verus_dir.join("report.toml"),
+        }
+    }
+    /// The backend when no `--backend` is given: `DJINN_BACKEND`, else the
+    /// metadata's `backend`, else the one whose report exists (Lean's first),
+    /// else Lean. The build gate, the `solution!` macro and `cargo djinn`
+    /// resolve it alike, so a crate compiles the solution its command meant.
+    pub fn resolve(env: Option<&str>, meta: Option<&str>, work: &Path, verus_dir: &Path) -> Result<Backend, String> {
+        match env.filter(|s| !s.trim().is_empty()).or(meta) {
+            Some(n) => Backend::parse(n).ok_or_else(|| format!("unknown backend `{n}`: use `lean` or `verus`")),
+            None if Backend::Lean.report_path(work, verus_dir).exists() => Ok(Backend::Lean),
+            None if Backend::Verus.report_path(work, verus_dir).exists() => Ok(Backend::Verus),
+            None => Ok(Backend::Lean),
+        }
+    }
     /// The backend a report records (`run.backend`), `Lean` for reports
     /// written before backends existed.
     pub fn of_report(report_text: &str) -> Backend {
@@ -429,8 +457,10 @@ impl Backend {
     /// Is `p`, inside the proof project `proofs`, skipped by the fingerprint:
     /// the build cache, or a file `cargo djinn` regenerates on every verify?
     /// Lean: `.lake/`, `<ns>/Code/`, `GENERATED_LEAN` in `<ns>/`. Verus:
-    /// `target/`, `.verus-log/`, and everything under `src/` except the
-    /// implementer's `src/proofs.rs` and `src/proofs/`.
+    /// `target/`, `.verus-log/`, `report.toml`, the run logs
+    /// `implement-runs.tsv`/`optimize-runs.tsv`, `solution/` (fingerprinted as
+    /// the solution), and everything under `src/` except the implementer's
+    /// `src/proofs.rs` and `src/proofs/`.
     pub fn is_generated(self, proofs: &Path, ns: &str, p: &Path) -> bool {
         match self {
             Backend::Lean => {
@@ -439,7 +469,10 @@ impl Backend {
             }
             Backend::Verus => {
                 let src = proofs.join("src");
-                p == proofs.join("target") || p == proofs.join(".verus-log") || (p.starts_with(&src) && p != src && p != src.join("proofs.rs") && !p.starts_with(src.join("proofs")))
+                // the report and the solution live in the Verus project too
+                // (`Backend::solution_dir`, `report_path`): the report is
+                // written by verify, the solution is walked on its own
+                p == proofs.join("target") || p == proofs.join(".verus-log") || p == proofs.join("report.toml") || p == proofs.join("solution") || p == proofs.join("implement-runs.tsv") || p == proofs.join("optimize-runs.tsv") || (p.starts_with(&src) && p != src && p != src.join("proofs.rs") && !p.starts_with(src.join("proofs")))
             }
         }
     }

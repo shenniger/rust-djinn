@@ -798,7 +798,8 @@ def replayUntrusted (build : String) : IO Nat := do
         | .ctorInfo v => todo := v.induct :: todo
         | .recInfo v => todo := v.all ++ todo
         | _ => pure ()
-  discard <| base.replay newC
+  -- the kernel's own environment (`Environment.replay` is deprecated since Lean 4.35)
+  discard <| Lean.Kernel.Environment.replay newC base.toKernelEnv
   return newC.size
 
 def phaseReplay : IO Unit := do
@@ -842,6 +843,21 @@ public import Aeneas
 open Aeneas Std Result
 set_option linter.dupNamespace false
 set_option linter.unusedVariables false
+
+/-- A bracket is an `ok` output meeting the post. Aeneas stated this lemma
+    under this name until October 2026 (`spec` was an inductive then; it is a
+    least fixed point over the coinductive `Result` now); the obligations'
+    `exists` and the proofs rely on it, so it lives here. -/
+theorem Aeneas.Std.WP.spec_equiv_exists {α : Type _} (m : Result α) (P : WP.Post α) :
+    WP.spec m P ↔ (∃ y, m = ok y ∧ P y) := by
+  constructor
+  · intro h
+    cases m with
+    | ret y => exact ⟨y, rfl, (WP.spec_ok y).mp h⟩
+    | vis e k => exact ((WP.spec_vis e k).mp h).elim
+    | div => exact (WP.spec_div.mp h).elim
+  · rintro ⟨y, rfl, hp⟩
+    exact (WP.spec_ok y).mpr hp
 
 namespace Djinn.Vocab
 
@@ -1029,21 +1045,12 @@ theorem memrchr_eq_some {n : U8} {l : List U8} {i : Nat} :
 theorem extend_from_slice_spec {T : Type} (cloneInst : core.clone.Clone T) (v : alloc.vec.Vec T) (s : Aeneas.Std.Slice T)
     (hc : ∀ x ∈ s.val, cloneInst.clone x = ok x) (h : v.length + s.length ≤ Usize.max) :
     alloc.vec.Vec.extend_from_slice cloneInst v s ⦃ r => r.val = v.val ++ s.val ⦄ := by
-  have hcl := Slice.clone_spec (clone := cloneInst.clone) hc
-  rw [WP.spec_equiv_exists] at hcl
-  obtain ⟨s', hs', hss⟩ := hcl
-  subst hss
   unfold alloc.vec.Vec.extend_from_slice
-  rw [dif_pos h]
   split
-  · rename_i s'' h'
-    simp [hs'] at h'
-    subst h'
-    simp
-  · rename_i h'
-    simp [hs'] at h'
-  · rename_i h'
-    simp [hs'] at h'
+  · apply WP.spec_bind (List.clone_spec hc)
+    intro s' hs'
+    simp [hs']
+  · exact absurd h (by assumption)
 
 /-- `slice.sort()`'s model: an insertion sort with Rust's `Ord::cmp`.
     `insertM` puts `x` before the first element it is not greater than;

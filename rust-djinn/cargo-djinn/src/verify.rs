@@ -122,10 +122,11 @@ pub struct Report {
 }
 
 impl Report {
-    /// `<work_dir>/report.toml`: next to `solution/` and `proofs/`, which it
-    /// certifies; committed with them. The `djinn!` macro reads it.
+    /// `<work_dir>/report.toml` (Lean) or `<verus_dir>/report.toml` (Verus):
+    /// next to the solution and proofs it certifies; committed with them. The
+    /// `djinn!` macro reads it.
     pub fn path(cfg: &Config) -> std::path::PathBuf {
-        cfg.work_dir.join("report.toml")
+        cfg.report_path()
     }
     pub fn log_path(cfg: &Config) -> std::path::PathBuf {
         cfg.state_dir().join("verify.log")
@@ -879,10 +880,45 @@ pub fn check_safe(cfg: &Config) -> Result<(), String> {
     let src = fs::read_to_string(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     let file = syn::parse_file(&src).map_err(|e| format!("{}: {e}", root.display()))?;
     let crate_wide = forbids(&file.attrs);
-    let module_level = file.items.iter().any(|it| matches!(it, syn::Item::Mod(m) if m.ident == "solution" && forbids(&m.attrs)));
-    if !crate_wide && !module_level {
+    // `djinn::solution!();` expands to the module under `#[forbid(unsafe_code)]`,
+    // read from this backend's solution directory
+    let by_macro = file.items.iter().any(|it| matches!(it, syn::Item::Macro(m) if m.mac.path.segments.last().is_some_and(|s| s.ident == "solution")));
+    // a written-out module must name this backend's solution: a crate holding
+    // one solution per backend would otherwise compile the other one
+    let path_of = |m: &syn::ItemMod| -> Option<String> {
+        m.attrs.iter().find(|a| a.path().is_ident("path")).and_then(|a| match &a.meta {
+            syn::Meta::NameValue(nv) => match &nv.value {
+                syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(l), .. }) => Some(l.value()),
+                _ => None,
+            },
+            _ => None,
+        })
+    };
+    let want = cfg.solution_dir().join("mod.rs");
+    let mut wrong_path = None;
+    for it in &file.items {
+        if let syn::Item::Mod(m) = it {
+            if m.ident == "solution" {
+                if let Some(p) = path_of(m) {
+                    let at = root.parent().unwrap_or(&cfg.crate_dir).join(&p);
+                    if at.canonicalize().ok() != want.canonicalize().ok() {
+                        wrong_path = Some(p);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(p) = wrong_path {
         return Err(format!(
-            "FAIL: {} must include the solution under `#[forbid(unsafe_code)]`:\n  #[forbid(unsafe_code)]\n  #[path = \"../{}/mod.rs\"]\n  pub mod solution;\n(or forbid unsafe_code crate-wide with `#![forbid(unsafe_code)]`)",
+            "FAIL: {} includes the solution from `{p}`, not from this backend's `{}`: write `djinn::solution!();` (it picks the backend's solution directory)",
+            cfg.rel(&root),
+            cfg.rel(&want)
+        ));
+    }
+    let module_level = file.items.iter().any(|it| matches!(it, syn::Item::Mod(m) if m.ident == "solution" && forbids(&m.attrs)));
+    if !crate_wide && !module_level && !by_macro {
+        return Err(format!(
+            "FAIL: {} must include the solution under `#[forbid(unsafe_code)]`: write `djinn::solution!();` (or\n  #[forbid(unsafe_code)]\n  #[path = \"../{}/mod.rs\"]\n  pub mod solution;\nor forbid unsafe_code crate-wide with `#![forbid(unsafe_code)]`)",
             cfg.rel(&root),
             cfg.sol_rel()
         ));
@@ -969,11 +1005,26 @@ pub fn proofs_started(cfg: &Config) -> bool {
 pub(crate) fn gate_build_script(cfg: &Config, log: &mut Log) -> Result<(), String> {
     // the implementer's proof files of the backend: `<proofs>/<NS>/` (Lean),
     // `<verus>/src/` (Verus: `proofs.rs` and `proofs/`)
-    let proof_dir = match cfg.backend {
-        Backend::Lean => cfg.lean_dir(),
-        Backend::Verus => cfg.verus_src(),
-    };
-    let lines = [cfg.rel(&cfg.solution_dir()), cfg.rel(&proof_dir)].map(|d| d.replace('\\', "/")).map(|d| format!("cargo:rerun-if-changed={d}"));
+    // — this backend's, and the other's too once it has a solution (a crate
+    // may hold one implementation per backend); a missing path would rerun
+    // the script on every build, so only existing ones are listed. The
+    // backend itself (`DJINN_BACKEND`) picks the solution `djinn::solution!`
+    // compiles.
+    let mut dirs = Vec::new();
+    for b in [cfg.backend, if cfg.is_verus() { Backend::Lean } else { Backend::Verus }] {
+        let sol = b.solution_dir(&cfg.work_dir, &cfg.verus_dir);
+        if b != cfg.backend && !sol.is_dir() {
+            continue;
+        }
+        let proof_dir = match b {
+            Backend::Lean => cfg.lean_dir(),
+            Backend::Verus => cfg.verus_src(),
+        };
+        dirs.push(cfg.rel(&sol));
+        dirs.push(cfg.rel(&proof_dir));
+    }
+    let mut lines: Vec<String> = dirs.iter().map(|d| d.replace('\\', "/")).map(|d| format!("cargo:rerun-if-changed={d}")).collect();
+    lines.push("cargo:rerun-if-env-changed=DJINN_BACKEND".into());
     let path = cfg.crate_dir.join("build.rs");
     let manifest = fs::read_to_string(cfg.crate_dir.join("Cargo.toml")).unwrap_or_default();
     let own = manifest.lines().any(|l| l.trim_start().starts_with("build") && l.contains('='));
@@ -1154,12 +1205,80 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
             fs::write(cfg.proofs.join("lean-toolchain"), t).map_err(|e| e.to_string())?;
         }
     }
+    sync_lake_files(cfg, log)?;
     // the harness guide, always refreshed (the scratch directory may not exist yet on a crate
     // that has never been run)
     fs::create_dir_all(cfg.state_dir()).map_err(|e| format!("{}: {e}", cfg.state_dir().display()))?;
     fs::write(cfg.guide_path(), crate::guide::guide(cfg, &lowered, &names)).map_err(|e| format!("{}: {e}", cfg.guide_path().display()))?;
     log.line(&format!("translated {} declarations into {}", lowered.len(), dir.display()));
     Ok(lowered)
+}
+
+/// The Aeneas Lean backend the proofs build against: the `require aeneas
+/// from "…"` of the lakefile, as written and resolved from the proofs
+/// directory.
+fn aeneas_backend(cfg: &Config) -> Option<(String, std::path::PathBuf)> {
+    let lakefile = fs::read_to_string(cfg.proofs.join("lakefile.lean")).ok()?;
+    let line = lakefile.lines().find(|l| l.trim_start().starts_with("require aeneas from"))?;
+    let path = line.split('"').nth(1)?;
+    Some((path.to_string(), cfg.proofs.join(path)))
+}
+
+/// `lean-toolchain` and `lake-manifest.json` follow the Aeneas backend: the
+/// toolchain is the backend's, and the manifest is the backend's with the
+/// backend itself as the first (path) package. The root manifest is the one
+/// Lake trusts, so a stale one would build the backend against the Mathlib
+/// it pins, not the one the backend wants. When Mathlib's revision changes,
+/// its prebuilt oleans are fetched (`lake exe cache get`): Lake would
+/// otherwise compile Mathlib.
+fn sync_lake_files(cfg: &Config, log: &mut Log) -> Result<(), String> {
+    let Some((require, backend)) = aeneas_backend(cfg) else { return Ok(()) };
+    if let Ok(t) = fs::read_to_string(backend.join("lean-toolchain")) {
+        let own = cfg.proofs.join("lean-toolchain");
+        if fs::read_to_string(&own).ok().map(|s| s.trim().to_string()).as_deref() != Some(t.trim()) {
+            fs::write(&own, &t).map_err(|e| e.to_string())?;
+            log.line(&format!("lean-toolchain updated to {}", t.trim()));
+        }
+    }
+    let Ok(bm) = fs::read_to_string(backend.join("lake-manifest.json")) else { return Ok(()) };
+    let mut expected: serde_json::Value = serde_json::from_str(&bm).map_err(|e| format!("{}: {e}", backend.join("lake-manifest.json").display()))?;
+    if let Some(pk) = expected.get_mut("packages").and_then(|p| p.as_array_mut()) {
+        for p in pk.iter_mut() {
+            if let Some(o) = p.as_object_mut() {
+                o.insert("inherited".into(), true.into());
+            }
+        }
+        pk.insert(0, serde_json::json!({"type": "path", "scope": "", "name": "aeneas", "manifestFile": "lake-manifest.json", "inherited": false, "dir": require, "configFile": "lakefile.lean"}));
+    }
+    // the lakefile's `package «name»`
+    let lakefile = fs::read_to_string(cfg.proofs.join("lakefile.lean")).unwrap_or_default();
+    // (Lake reads the manifest's `name` as a Lean `Name`: a name that is not a
+    // plain identifier, such as `lz4-compress`, keeps its «» there)
+    let name = lakefile.lines().find_map(|l| l.trim_start().strip_prefix("package «")).and_then(|r| r.split('»').next()).unwrap_or(&cfg.crate_name).to_string();
+    let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    expected["name"] = if plain { name } else { format!("«{name}»") }.into();
+    let own = cfg.proofs.join("lake-manifest.json");
+    let pins = |m: &serde_json::Value| -> BTreeMap<String, String> {
+        m["packages"].as_array().into_iter().flatten().map(|p| (p["name"].as_str().unwrap_or("").to_string(), p["rev"].as_str().or(p["dir"].as_str()).unwrap_or("").to_string())).collect()
+    };
+    let own_manifest = fs::read_to_string(&own).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let have = own_manifest.as_ref().map(pins).unwrap_or_default();
+    let want = pins(&expected);
+    if have == want && own_manifest.as_ref().map(|m| m["name"] == expected["name"]).unwrap_or(false) {
+        return Ok(());
+    }
+    fs::write(&own, serde_json::to_string_pretty(&expected).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let short = |s: Option<&String>| s.map(|s| s.chars().take(8).collect::<String>()).unwrap_or_else(|| "none".into());
+    let changed: Vec<String> = want.iter().filter(|(k, v)| have.get(*k) != Some(v)).map(|(k, v)| format!("{k} {} → {}", short(have.get(k)), short(Some(v)))).collect();
+    log.line(&format!("lake-manifest.json updated to the Aeneas backend's: {}", changed.join(", ")));
+    if have.get("mathlib") != want.get("mathlib") {
+        // Mathlib's oleans for the new revision (Lake moves the checkout first)
+        let out = run(Command::new("lake").args(["exe", "cache", "get"]).current_dir(&cfg.proofs), "lake exe cache get", log)?;
+        if let Some(l) = out.lines().rev().find(|l| !l.trim().is_empty()) {
+            log.line(l);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn run(cmd: &mut Command, what: &str, log: &mut Log) -> Result<String, String> {
@@ -1291,8 +1410,8 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
     // drivers, which Charon must not even compile
     charon.args(["--", "--lib"]);
     run(&mut charon, "charon", log).map_err(|e| stage("charon", e))?;
-    // 2b. what Aeneas would print unescaped into Code/ (string and char
-    // literals, source paths in doc comments) must not be able to spell Lean
+    // 2b. what Aeneas has no Lean form for (byte strings, floats), and what it
+    // would print into a Lean comment (source paths, names), must not be there
     let llbc_text = fs::read_to_string(&llbc).map_err(|e| stage("charon", format!("{}: {e}", llbc.display())))?;
     let llbc_json: serde_json::Value = serde_json::from_str(&llbc_text).map_err(|e| stage("charon", format!("{}: {e}", llbc.display())))?;
     if let Some(bad) = unprintable_literals(&llbc_json).into_iter().next() {
@@ -1313,6 +1432,20 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
         log,
     )
     .map_err(|e| stage("aeneas", e))?;
+    // 3b. the literals Aeneas printed, read back with Lean's lexical rules,
+    // must be the program's: an Aeneas printing a `"` raw could not pass
+    let mut code_files = Vec::new();
+    for e in fs::read_dir(&code_dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "lean") && !p.file_name().is_some_and(|n| n.to_string_lossy().contains("_Template")) {
+            let name = format!("Code/{}", p.file_name().unwrap_or_default().to_string_lossy());
+            let bytes = fs::read(&p).map_err(|e| stage("aeneas", format!("{}: {e}", p.display())))?;
+            // (an Aeneas printing a non-ASCII char byte-wise writes no UTF-8)
+            let text = String::from_utf8(bytes).map_err(|_| stage("literals", format!("FAIL: {name} is not UTF-8: Aeneas printed a literal byte by byte")))?;
+            code_files.push((name, text));
+        }
+    }
+    check_code_literals(&code_files, &llbc_json).map_err(|e| stage("literals", format!("FAIL: {e}")))?;
     // 4. audit translation.json: no local opaque items, no unknown externals
     // (Aeneas writes it next to its output; it belongs to the scratch space)
     let _ = fs::rename(cfg.proofs.join("translation.json"), cfg.translation_path());
@@ -1355,17 +1488,12 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
     Ok(())
 }
 
-/// Text in Charon's output that Aeneas would print into `Code/` without the
-/// escaping Lean needs: Aeneas writes a string literal as `"…"` escaping only
-/// `\` and control characters (and those as `\ddd`, which Lean does not
-/// read), a char as `'…'` escaping nothing, and source paths into `/-- … -/`.
-/// A `"` in a literal ends the Lean string early, and what follows would be
-/// Lean code. Allowed: printable ASCII without `"` and `\` (in a char also
-/// without `'`); no `/-` or `-/` in any other string (paths, names).
+/// Text in Charon's output that Aeneas cannot print faithfully into `Code/`:
+/// byte-string and float literals (Aeneas writes `sorry` for them), and `/-`
+/// or `-/` in a name or source path (printed into a Lean comment, which they
+/// would close early). String and char literals may hold anything: Aeneas
+/// escapes them, and `check_code_literals` reads them back.
 fn unprintable_literals(v: &serde_json::Value) -> Vec<String> {
-    fn plain(s: &str, quote: char) -> bool {
-        s.chars().all(|c| (' '..='~').contains(&c) && c != '"' && c != '\\' && c != quote)
-    }
     fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
         match v {
             serde_json::Value::Object(m) => {
@@ -1374,8 +1502,9 @@ fn unprintable_literals(v: &serde_json::Value) -> Vec<String> {
                         // Charon's own options (its output path) and the files'
                         // source text: not printed by Aeneas
                         ("options" | "contents", _) => {}
-                        ("Str", serde_json::Value::String(s)) if !plain(s, '"') => out.push(format!("the string literal {s:?} in the solution cannot be translated safely: Aeneas would print it into Lean unescaped. Use printable ASCII without `\"` and `\\` (build other text from bytes)")),
-                        ("Char", serde_json::Value::String(s)) if !plain(s, '\'') => out.push(format!("the char literal {s:?} in the solution cannot be translated safely: Aeneas would print it into Lean unescaped. Use a `u8` or `u32` code instead")),
+                        ("Str" | "Char", serde_json::Value::String(_)) => {}
+                        ("ByteStr", serde_json::Value::Array(_)) => out.push("a byte string literal (`b\"…\"`) in the solution cannot be translated: Aeneas has no Lean form for it. Use an array of `u8`".into()),
+                        ("Float", serde_json::Value::Object(_)) => out.push("a float literal in the solution cannot be translated: Aeneas has no Lean form for it".into()),
                         (_, serde_json::Value::String(s)) if s.contains("/-") || s.contains("-/") => out.push(format!("{s:?} (a name or source path in the translated program) holds `/-` or `-/`, which Aeneas would print into a Lean comment: rename it")),
                         _ => walk(x, out),
                     }
@@ -1391,51 +1520,225 @@ fn unprintable_literals(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// A token of Aeneas's Lean output.
+#[derive(Debug, Clone, PartialEq)]
+enum LeanTok {
+    Ident(String),
+    /// a string literal, decoded
+    Str(String),
+    /// a char literal, decoded
+    Char(char),
+    /// any other character (punctuation, digits)
+    Other(char),
+}
+
+/// Lean's lexical rules, as far as reading literals back needs them: comments
+/// (`--`, nested `/- -/`) are skipped; an identifier (also `«…»`, and with
+/// `'`, `!`, `?` or subscripts inside) is one token, so its `'` is not a
+/// char; `"…"` and `'…'` are decoded with Lean's escapes (`\\ \" \' \n \t \r
+/// \xHH \uHHHH`). Anything else after a `\`, a malformed char and an
+/// unterminated literal or comment are errors. Each token comes with its
+/// byte range.
+fn lean_tokens(text: &str) -> Result<Vec<(LeanTok, usize, usize)>, String> {
+    let cs: Vec<(usize, char)> = text.char_indices().collect();
+    let n = cs.len();
+    let at = |k: usize| cs.get(k).map(|x| x.1);
+    let end = |k: usize| if k < n { cs[k].0 } else { text.len() };
+    let line = |k: usize| text[..end(k)].matches('\n').count() + 1;
+    let ident_rest = |c: char| c.is_alphanumeric() || matches!(c, '_' | '\'' | '!' | '?') || ('\u{2080}'..='\u{209C}').contains(&c);
+    // the escape after a `\` at `j`: its char and the index after it
+    let escape = |j: usize| -> Result<(char, usize), String> {
+        let hex = |from: usize, len: usize| -> Result<char, String> {
+            let digits: String = (from..from + len).filter_map(at).collect();
+            if digits.chars().count() == len && digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32).ok_or_else(|| format!("line {}: `\\x`/`\\u` escape is not a character", line(from)))
+            } else {
+                Err(format!("line {}: `\\x`/`\\u` escape needs exactly {len} hex digits", line(from)))
+            }
+        };
+        Ok(match at(j) {
+            Some('\\') => ('\\', j + 1),
+            Some('"') => ('"', j + 1),
+            Some('\'') => ('\'', j + 1),
+            Some('n') => ('\n', j + 1),
+            Some('t') => ('\t', j + 1),
+            Some('r') => ('\r', j + 1),
+            Some('x') => (hex(j + 1, 2)?, j + 3),
+            Some('u') => (hex(j + 1, 4)?, j + 5),
+            Some(c) => return Err(format!("line {}: `\\{c}` is not a Lean escape", line(j))),
+            None => return Err(format!("line {}: unterminated literal", line(j))),
+        })
+    };
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let (pos, c) = cs[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '-' && at(i + 1) == Some('-') {
+            while i < n && cs[i].1 != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && at(i + 1) == Some('-') {
+            let (mut j, mut depth) = (i + 2, 1);
+            while j < n && depth > 0 {
+                if cs[j].1 == '/' && at(j + 1) == Some('-') {
+                    depth += 1;
+                    j += 2;
+                } else if cs[j].1 == '-' && at(j + 1) == Some('/') {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if depth > 0 {
+                return Err(format!("line {}: unterminated comment", line(i)));
+            }
+            i = j;
+        } else if c == '«' {
+            let mut j = i + 1;
+            while j < n && cs[j].1 != '»' {
+                j += 1;
+            }
+            if j >= n {
+                return Err(format!("line {}: unterminated «name»", line(i)));
+            }
+            toks.push((LeanTok::Ident(text[pos..end(j + 1)].to_string()), pos, end(j + 1)));
+            i = j + 1;
+        } else if c.is_alphabetic() || c == '_' {
+            let mut j = i + 1;
+            while j < n && ident_rest(cs[j].1) {
+                j += 1;
+            }
+            toks.push((LeanTok::Ident(text[pos..end(j)].to_string()), pos, end(j)));
+            i = j;
+        } else if c == '"' {
+            let mut s = String::new();
+            let mut j = i + 1;
+            loop {
+                match at(j) {
+                    None => return Err(format!("line {}: unterminated string literal", line(i))),
+                    Some('"') => break,
+                    Some('\\') => {
+                        let (ch, k) = escape(j + 1)?;
+                        s.push(ch);
+                        j = k;
+                    }
+                    Some(ch) => {
+                        s.push(ch);
+                        j += 1;
+                    }
+                }
+            }
+            toks.push((LeanTok::Str(s), pos, end(j + 1)));
+            i = j + 1;
+        } else if c == '\'' {
+            // Lean does not read `''` as the start of a char literal
+            let (ch, j) = match at(i + 1) {
+                Some('\\') => escape(i + 2)?,
+                Some(ch) if ch != '\'' => (ch, i + 2),
+                _ => return Err(format!("line {}: malformed char literal", line(i))),
+            };
+            if at(j) != Some('\'') {
+                return Err(format!("line {}: malformed char literal", line(i)));
+            }
+            toks.push((LeanTok::Char(ch), pos, end(j + 1)));
+            i = j + 1;
+        } else {
+            toks.push((LeanTok::Other(c), pos, end(i + 1)));
+            i += 1;
+        }
+    }
+    Ok(toks)
+}
+
+/// The literals in Charon's output: the `Str` and `Char` values, skipping
+/// what Aeneas never prints. Sets, not multisets: Charon interns constants (a
+/// second use of a literal is a reference to the first), and Aeneas drops
+/// some (the messages of `panic!`/`assert!`, which become `massert`/`fail`).
+fn llbc_literals(v: &serde_json::Value, strs: &mut std::collections::BTreeSet<String>, chars: &mut std::collections::BTreeSet<char>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m {
+                match (k.as_str(), x) {
+                    ("options" | "contents", _) => {}
+                    ("Str", serde_json::Value::String(s)) => {
+                        strs.insert(s.clone());
+                    }
+                    ("Char", serde_json::Value::String(s)) if s.chars().count() == 1 => {
+                        chars.insert(s.chars().next().unwrap());
+                    }
+                    _ => llbc_literals(x, strs, chars),
+                }
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| llbc_literals(x, strs, chars)),
+        _ => {}
+    }
+}
+
+/// The literals Aeneas printed into `Code/`, read back with Lean's lexical
+/// rules, against the program's (the LLBC): a defence in depth against an
+/// Aeneas that prints a `"` or a `'` raw, where the rest of the literal
+/// would be Lean code. Every `toStr "…"` of `Code/` must be a `Str` literal
+/// of the program and every char literal a `Char`. The raw `"` would end the
+/// literal early, so what Lean reads is a prefix of the program's literal,
+/// which is not one of its literals (unless the solution also holds that
+/// prefix: the escaping Aeneas is the first line of defence, the axiom audit
+/// the last). Other string literals are Aeneas's own (attribute arguments
+/// such as `@[rust_fun "…"]`, target names): lexed, so that they cannot hide
+/// anything, but not from the program. `files` are the `Code/*.lean` texts.
+fn check_code_literals(files: &[(String, String)], llbc: &serde_json::Value) -> Result<(), String> {
+    let (mut strs, mut chars) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    llbc_literals(llbc, &mut strs, &mut chars);
+    for (name, text) in files {
+        let toks = lean_tokens(text).map_err(|e| format!("{name} is not well-formed Lean: {e}"))?;
+        for (k, (tok, _, _)) in toks.iter().enumerate() {
+            match tok {
+                LeanTok::Str(s) if matches!(toks.get(k.wrapping_sub(1)), Some((LeanTok::Ident(id), _, _)) if id == "toStr") => {
+                    if !strs.contains(s) {
+                        return Err(format!("{name} holds the string literal {s:?} (as `toStr`'s argument), which is not a string literal of the translated program"));
+                    }
+                }
+                LeanTok::Char(c) => {
+                    if !chars.contains(c) {
+                        return Err(format!("{name} holds the char literal {c:?}, which is not a char literal of the translated program"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The proof of `toStr`'s bound (`s.toByteArray.size ≤ U32.max`) given to every
 /// `toStr "…"` of Aeneas's output: `U32.max` is irreducible, so it is rewritten
 /// to its numeral first; the literal's size then reduces in the kernel.
 const STR_BOUND: &str = "(by rw [show Aeneas.Std.U32.max = 4294967295 by scalar_tac]; decide +kernel)";
 
-/// `toStr "…"` → `toStr "…" STR_BOUND`, for each call without an explicit proof.
+/// `toStr "…"` → `toStr "…" STR_BOUND`, for each call without an explicit
+/// proof (`(by …)`). The literal is found by `lean_tokens`, so a `"` inside
+/// it (escaped) does not end it; text that does not lex is left alone
+/// (`check_code_literals` has refused it).
 fn kernel_str_literals(text: &str) -> String {
-    let b = text.as_bytes();
+    let Ok(toks) = lean_tokens(text) else { return text.to_string() };
     let mut out = String::with_capacity(text.len());
-    let mut i = 0;
     let mut last = 0;
-    while let Some(k) = text[i..].find("toStr") {
-        let s = i + k;
-        let after = s + "toStr".len();
-        i = after;
-        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'\'';
-        if (s > 0 && ident(b[s - 1])) || (after < b.len() && ident(b[after])) {
+    for (k, (tok, _, end)) in toks.iter().enumerate() {
+        let after_to_str = matches!(toks.get(k.wrapping_sub(1)), Some((LeanTok::Ident(id), _, _)) if id == "toStr");
+        if !(matches!(tok, LeanTok::Str(_)) && after_to_str) {
             continue;
         }
-        // the literal: whitespace, then `"` … `"` (with `\` escapes)
-        let mut j = after;
-        while j < b.len() && (b[j] as char).is_whitespace() {
-            j += 1;
-        }
-        if j >= b.len() || b[j] != b'"' {
+        let has_proof = matches!(toks.get(k + 1), Some((LeanTok::Other('('), _, _))) && matches!(toks.get(k + 2), Some((LeanTok::Ident(by), _, _)) if by == "by");
+        if has_proof {
             continue;
         }
-        let mut q = j + 1;
-        while q < b.len() && b[q] != b'"' {
-            q += if b[q] == b'\\' { 2 } else { 1 };
-        }
-        if q >= b.len() {
-            break;
-        }
-        let end = q + 1;
-        // already given a proof?
-        let rest = text[end..].trim_start();
-        if rest.starts_with("(by") {
-            continue;
-        }
-        out.push_str(&text[last..end]);
+        out.push_str(&text[last..*end]);
         out.push(' ');
         out.push_str(STR_BOUND);
-        last = end;
-        i = end;
+        last = *end;
     }
     out.push_str(&text[last..]);
     out
@@ -1801,6 +2104,9 @@ mod tests {
         assert!(r.contains("(toStr\n        \"div \\\"by\\\" zero\" (by rw [show"), "{r}");
         assert_eq!(r.matches("decide +kernel").count(), 1, "{r}");
         assert!(r.contains("myToStr \"y\""), "{r}");
+        // a `"` or `'` inside the literal does not end it; `(by` after it is a proof
+        let r = super::kernel_str_literals("f (toStr \"q\\\"'\") (toStr \"a\" (by simp)) (toStr\n  \"\\u00e9\")");
+        assert_eq!(r, format!("f (toStr \"q\\\"'\" {0}) (toStr \"a\" (by simp)) (toStr\n  \"\\u00e9\" {0})", super::STR_BOUND));
     }
 
     #[test]
@@ -1867,10 +2173,44 @@ mod tests {
     #[test]
     fn literals_aeneas_cannot_print_are_refused() {
         let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
-        assert!(super::unprintable_literals(&j(r#"{"options": {"dest_file": "/tmp/-x/-/a"}, "files": [{"name": {"Local": "src/lib.rs"}, "contents": "a /- b"}], "v": {"Value": {"Str": "plain text, it's fine"}}, "c": {"Value": {"Char": "x"}}}"#)).is_empty());
-        for bad in [r#"{"Value": {"Str": "q\" axiom evil : False"}}"#, r#"{"Value": {"Str": "back\\slash"}}"#, r#"{"Value": {"Str": "é"}}"#, r#"{"Value": {"Str": "nl\n"}}"#, r#"{"Value": {"Char": "'"}}"#, r#"{"Value": {"Char": "\\"}}"#, r#"{"files": [{"name": {"Local": "src/a-/b.rs"}}]}"#] {
+        // strings and chars are escaped by Aeneas now: anything goes
+        assert!(super::unprintable_literals(&j(r#"{"options": {"dest_file": "/tmp/-x/-/a"}, "files": [{"name": {"Local": "src/lib.rs"}, "contents": "a /- b"}], "v": {"Value": {"Str": "q\" axiom evil : False -/"}}, "w": {"Value": {"Str": "é\n\\"}}, "c": {"Value": {"Char": "'"}}, "d": {"Value": {"Char": "\\"}}, "t": {"Float": "F64"}}"#)).is_empty());
+        for bad in [r#"{"Value": {"ByteStr": [1, 2]}}"#, r#"{"Value": {"Float": {"value": "1.5", "ty": "F64"}}}"#, r#"{"files": [{"name": {"Local": "src/a-/b.rs"}}]}"#, r#"{"name": "x /- y"}"#] {
             assert_eq!(super::unprintable_literals(&j(bad)).len(), 1, "{bad}");
         }
+    }
+
+    #[test]
+    fn lean_literals_are_read_with_leans_escapes() {
+        use super::LeanTok::*;
+        let toks = |s: &str| super::lean_tokens(s).unwrap().into_iter().map(|t| t.0).collect::<Vec<_>>();
+        assert_eq!(
+            toks("toStr \"tab\\tnl\\nq\\\"bs\\\\\\u00e9\\u20ac😀\\x7f\" -- \"not\" 'x'\n/- 'a /- nested -/ -/ x' h'' «a b'» 'é' '\\'' '\\\\' '\\n' '\"' 3#i32"),
+            vec![Ident("toStr".into()), Str("tab\tnl\nq\"bs\\é€😀\x7f".into()), Ident("x'".into()), Ident("h''".into()), Ident("«a b'»".into()), Char('é'), Char('\''), Char('\\'), Char('\n'), Char('"'), Other('3'), Other('#'), Ident("i32".into())]
+        );
+        // the unpatched Aeneas's output: the literal ends at the raw `"`
+        assert_eq!(toks("toStr \"x\" axiom evil : False --\"")[..3], [Ident("toStr".into()), Str("x".into()), Ident("axiom".into())]);
+        for bad in ["\"abc", "'ab'", "'''", "'\\", "\"\\q\"", "\"\\x4\"", "\"\\u{e9}\"", "/- open", "\"a\\\nb\""] {
+            assert!(super::lean_tokens(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn code_literals_must_be_the_programs() {
+        let llbc = serde_json::from_str::<serde_json::Value>(r#"{"options": {"dest_file": "\"zz\""}, "a": {"Str": "x\" axiom evil : False --"}, "b": {"Str": "é"}, "c": {"Str": "é"}, "d": {"Char": "'"}, "e": {"Char": "\n"}, "targets": ["x86_64-apple-darwin"]}"#).unwrap();
+        let ok = |code: &str| super::check_code_literals(&[("Code/Funs.lean".into(), code.into())], &llbc);
+        assert_eq!(ok("def f := toStr \"x\\\" axiom evil : False --\"\ndef g := (toStr \"\\u00e9\", toStr \"é\", '\\'', '\\n')\nif tgt = \"x86_64-apple-darwin\" then 1 else 0"), Ok(()));
+        // the injection: `"x"` is not a literal of the program, and the long one is missing
+        let e = ok("def f := toStr \"x\" axiom evil : False --\"\ndef g := (toStr \"é\", toStr \"é\", '\\'', '\\n')").unwrap_err();
+        assert!(e.contains("Code/Funs.lean holds the string literal \"x\"") && e.contains("not a string literal of the translated program"), "{e}");
+        // chars printed raw: `'\'` and `'''` are not Lean (`'<newline>'` is)
+        assert!(ok("def g := ('\\', '\\n')").unwrap_err().contains("not well-formed Lean"));
+        assert!(ok("def g := (''', '\\n')").unwrap_err().contains("not well-formed Lean"));
+        assert_eq!(ok("def g := ('\n', '\\'')"), Ok(()));
+        // a literal the program does not have; Aeneas's own strings are free
+        assert!(ok("toStr \"é\" '\\'' 'x'").unwrap_err().contains("'x'"));
+        assert!(ok("toStr \"x\\\" axiom evil : False -- \"").unwrap_err().contains("not a string literal of"));
+        assert_eq!(ok("@[rust_fun \"core::str::{str}::len\"] toStr \"é\""), Ok(()));
     }
 
     #[test]

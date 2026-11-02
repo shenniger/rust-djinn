@@ -114,6 +114,9 @@ pub struct Param {
     pub ty: RType,
     /// `&mut T`: the parameter is also an output.
     pub mut_ref: bool,
+    /// `&T` whose `T` is not `[E]` or `str` (those types already say `&`):
+    /// the implementation takes it by reference (`st: &State`).
+    pub shared_ref: bool,
     pub span: Span,
 }
 

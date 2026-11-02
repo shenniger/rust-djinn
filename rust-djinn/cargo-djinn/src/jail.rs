@@ -114,6 +114,12 @@ pub fn create(cfg: &Config, id: &str, bin: &Path) -> Result<PathBuf, String> {
     // Rust side: the crate's layout, with the solution directory in place
     fs::write(dir.join("Cargo.toml"), jail_cargo_toml(cfg)?).map_err(|e| e.to_string())?;
     copy_dir(&cfg.crate_dir.join("src"), &dir.join("src"))?;
+    // the benchmark data (`<crate>/bench-data`, mostly links into the shortlist's
+    // corpora) is shared, not copied, so that `env!("CARGO_MANIFEST_DIR")/bench-data`
+    // resolves in the jail too
+    if let Ok(real) = cfg.crate_dir.join("bench-data").canonicalize() {
+        let _ = std::os::unix::fs::symlink(&real, dir.join("bench-data"));
+    }
     let jsol = sol_in(cfg, &dir);
     if cfg.solution_dir().is_dir() {
         copy_dir(&cfg.solution_dir(), &jsol)?;
@@ -182,7 +188,9 @@ pub fn create(cfg: &Config, id: &str, bin: &Path) -> Result<PathBuf, String> {
         }
     }
     // `./bench` times the jail's own copy (its Cargo.toml has absolute paths)
-    let bench = format!("#!/bin/sh\n# time the performance workload of this jail's copy of the crate\nexec '{}' bench --backend {} --manifest-path '{}/Cargo.toml' \"$@\"\n", bin.display(), cfg.backend.name(), dir.display());
+    // the optimizer's DJINN_BENCH_TIMEOUT holds for the agent's runs too
+    let limit = crate::bench::timeout().map(|l| format!("DJINN_BENCH_TIMEOUT={l} ")).unwrap_or_default();
+    let bench = format!("#!/bin/sh\n# time the performance workload of this jail's copy of the crate\n{limit}exec '{}' bench --backend {} --manifest-path '{}/Cargo.toml' \"$@\"\n", bin.display(), cfg.backend.name(), dir.display());
     fs::write(dir.join("bench"), bench).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
@@ -192,7 +200,7 @@ pub fn create(cfg: &Config, id: &str, bin: &Path) -> Result<PathBuf, String> {
     if cfg.is_verus() {
         // `./verus-check`: Verus on the jail's copy of the verification crate, as it is
         let check = format!(
-            "#!/bin/sh\n# run Verus on this jail's copy of the verification crate (nothing synced, nothing compiled); 1-5 min on a large spec; narrow with --verify-only-module proofs [--verify-function 'lemma_*']\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncd '{}' && exec '{}' --crate-type=lib src/lib.rs --edition={} --no-cheating --multiple-errors 4 --triggers-mode silent \"$@\"\n",
+            "#!/bin/sh\n# run Verus on this jail's copy of the verification crate (nothing synced, nothing compiled); 1-5 min on a large spec; narrow with --verify-only-module proofs [--verify-function 'lemma_*']\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncd '{}' && exec '{}' --crate-type=lib src/lib.rs --edition={} --no-cheating --multiple-errors 4 --triggers-mode silent --smt-option memory_max_size=6144 \"$@\"\n",
             jproofs.display(),
             cfg.verus,
             cfg.edition

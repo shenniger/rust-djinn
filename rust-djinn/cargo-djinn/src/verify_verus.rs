@@ -908,6 +908,12 @@ fn banned(ts: proc_macro2::TokenStream) -> Option<String> {
 
 // ------------------------------------------------------------------ verify
 
+/// A cap on each Z3 instance's memory (MiB): a runaway query (one took
+/// 9.5 GiB twice over in example/utf8) fails as an error instead of taking
+/// the machine's memory from every other run. It only ever turns a result
+/// into an error, never an error into a PASS.
+pub(crate) const Z3_MEMORY: [&str; 2] = ["--smt-option", "memory_max_size=6144"];
+
 /// Run Verus on the verification crate.
 fn run_verus(cfg: &Config, log: &mut Log) -> Result<String, (String, String)> {
     let mut cmd = Command::new(&cfg.verus);
@@ -917,6 +923,7 @@ fn run_verus(cfg: &Config, log: &mut Log) -> Result<String, (String, String)> {
         .arg("--crate-name")
         .arg(format!("{}_verus", cfg.crate_name.replace('-', "_")))
         .args(["--no-cheating", "--multiple-errors", "4", "--triggers-mode", "silent", "--no-report-long-running"])
+        .args(Z3_MEMORY)
         .current_dir(&cfg.verus_dir);
     // `verus` runs `rustup`, which lives beside `cargo`
     if let Some(home) = std::env::var_os("HOME") {
@@ -1202,7 +1209,7 @@ pub fn local_states(cfg: &Config, proofs_root: &Path, timeout_secs: u64) -> Opti
     let tn = crate::verify::parse_spec(cfg).map(|p| type_names(cfg, &p)).ok()?;
     let cx = EmitCx { names: &tn, impl_names: &names };
     let mut cmd = Command::new(&cfg.verus);
-    cmd.arg("--crate-type=lib").arg("src/lib.rs").arg(format!("--edition={}", cfg.edition)).args(["--no-cheating", "--multiple-errors", "2", "--triggers-mode", "silent", "--no-report-long-running"]).current_dir(proofs_root).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.arg("--crate-type=lib").arg("src/lib.rs").arg(format!("--edition={}", cfg.edition)).args(["--no-cheating", "--multiple-errors", "2", "--triggers-mode", "silent", "--no-report-long-running"]).args(Z3_MEMORY).current_dir(proofs_root).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     if let Some(home) = std::env::var_os("HOME") {
         let cargo_bin = Path::new(&home).join(".cargo").join("bin");
         let mut path = cargo_bin.into_os_string();

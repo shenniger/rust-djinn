@@ -27,7 +27,7 @@ fn usage() -> ExitCode {
   translate
   verify [--jail DIR]                          exit status: 0 PASS, 1 FAIL, 3 specification verified
                                                but some fn not implemented yet (not a PASS)
-  implement [--agent codex|claude] [--background] [-B|--reimplement] [--yolo] [--model M] [--effort E]
+  implement [--agent codex|claude|omp] [--background] [-B|--reimplement] [--yolo] [--model M] [--effort E]
             [--limit USD] [--max-budget-usd N] [--args \"...\"] [--prompt TEXT | --prompt-file F]
             (reuses existing solution/proofs and only completes what is missing; -B starts over)
   status [--local]                             declarations implemented/proved per the last report, agent jobs, cost;
@@ -38,8 +38,10 @@ fn usage() -> ExitCode {
   guide
   bench [--min-time S] [--batches K] [--jobs J] time the workload named by [package.metadata.djinn] bench
                                                (with bench_points: every point, J at a time; default 4)
+  bench --heldout                              the same over the held-out set (bench_heldout = \"bench::workload_heldout\"),
+                                               which optimize never measures; refused from a jail
   optimize (--cycles N | --limit USD) [--min-time S] [--batches K] [--jobs J] [--threshold PCT]
-           [--agent codex|claude] [--model M] [--args \"...\"] [--prompt TEXT]
+           [--agent codex|claude|omp] [--model M] [--args \"...\"] [--prompt TEXT]
            (hill-climb on the workload under the verifier; Ctrl-C reverts to the last known-good state;
             a restart resumes the history: --cycles and --limit count every run; exit 5 on an agent API error)
   smoke-test [--max-len N] [--int-bound B] [--max-examples K] [--timeout S] [--only NAME]
@@ -78,6 +80,7 @@ fn main() -> ExitCode {
     let mut jobs = 4usize;
     let mut threshold = 0.03f64;
     let mut bench_override: Option<String> = None;
+    let mut heldout = false;
     let mut restore: Option<Option<String>> = None;
     let mut list_backups = false;
     let mut local = false;
@@ -114,6 +117,7 @@ fn main() -> ExitCode {
                 opts.agent = match next(&mut i, &args).as_deref() {
                     Ok("claude") => agent::Agent::Claude,
                     Ok("codex") => agent::Agent::Codex,
+                    Ok("omp") => agent::Agent::Omp,
                     _ => return usage(),
                 }
             }
@@ -147,6 +151,7 @@ fn main() -> ExitCode {
             "--jobs" => jobs = match next(&mut i, &args) { Ok(v) => v.parse().unwrap_or(4), Err(c) => return c },
             "--threshold" => threshold = match next(&mut i, &args) { Ok(v) => v.trim_end_matches('%').parse::<f64>().map(|x| x / 100.0).unwrap_or(0.03), Err(c) => return c },
             "--bench" => bench_override = Some(match next(&mut i, &args) { Ok(v) => v, Err(c) => return c }),
+            "--heldout" => heldout = true,
             "--prompt-file" => {
                 let f = match next(&mut i, &args) { Ok(v) => v, Err(c) => return c };
                 match std::fs::read_to_string(&f) {
@@ -171,6 +176,19 @@ fn main() -> ExitCode {
     };
     if let Some(b) = bench_override {
         cfg.bench = Some(b);
+    }
+    if heldout {
+        if cfg.in_jail {
+            eprintln!("error: the held-out set is measured from the real crate only, never from a jail: `optimize` must not see it");
+            return ExitCode::from(2);
+        }
+        match cfg.bench_heldout.clone() {
+            Some(h) => cfg.bench = Some(h),
+            None => {
+                eprintln!("error: no held-out workload: set [package.metadata.djinn] bench_heldout = \"bench::workload_heldout\"");
+                return ExitCode::from(2);
+            }
+        }
     }
     let r: Result<bool, String> = match cmd.as_deref() {
         Some("translate") => verify::translate(&cfg, &mut verify::Log::new(true)).map(|_| true),
