@@ -1212,8 +1212,19 @@ impl<'a> L<'a> {
             ExprKind::Bool(true) => "True".into(),
             ExprKind::Bool(false) => "False".into(),
             ExprKind::Not(x) => format!("¬({})", self.prop(x)?),
-            ExprKind::Bin(BinOp::And, l, r) => format!("({} ∧ {})", self.prop(l)?, self.prop(r)?),
-            ExprKind::Bin(BinOp::Or, l, r) => format!("({} ∨ {})", self.prop(l)?, self.prop(r)?),
+            // the right operand is read under the left's truth (resp. falsity), as Rust's
+            // short-circuit operators are: its partial operations need only be defined there
+            ExprKind::Bin(op @ (BinOp::And | BinOp::Or), l, r) => {
+                let lp = self.prop(l)?;
+                let pending = std::mem::take(&mut self.guards);
+                self.cx.push(Cx::Guard(if *op == BinOp::And { lp.clone() } else { format!("¬({lp})") }));
+                let rr = self.prop(r);
+                self.flush_guards();
+                self.cx.pop();
+                self.guards = pending;
+                let rp = rr?;
+                if *op == BinOp::And { format!("({lp} ∧ {rp})") } else { format!("({lp} ∨ {rp})") }
+            }
             ExprKind::Bin(op, l, r) if matches!(op, BinOp::Eq | BinOp::Ne) && (is_proplike(l) || is_proplike(r)) => {
                 // `b == (proposition)` for a boolean b: `(b = true ↔ P)`
                 let (bside, pside) = if is_proplike(r) { (l, r) } else { (r, l) };
@@ -2103,6 +2114,23 @@ mod bit_tests {
     fn lowered(src: &str) -> Vec<crate::lower::Lowered> {
         let p = crate::parse_program(src).unwrap();
         crate::lower_program(&p).unwrap()
+    }
+
+    #[test]
+    fn short_circuit_guards_the_right_operand_in_a_value_if() {
+        let l = lowered("djinn! { pub rel f(s: &[u8], n: i64) -> r: i64 { r == if n > 0 && s[n - 1] == 61 { n - 1 } else { n }; } }");
+        let wf = l[0].wf.join(" | ");
+        // the index obligation holds only where the left operand does
+        assert!(l[0].wf.iter().any(|w| w.starts_with("n.val > 0 → (0 ≤ (n.val - 1)")), "{wf}");
+        let l = lowered("djinn! { pub rel g(s: &[u8], n: i64) -> r: i64 { r == if n <= 0 || s[n - 1] == 61 { n } else { 0 }; } }");
+        let wf = l[0].wf.join(" | ");
+        assert!(l[0].wf.iter().any(|w| w.starts_with("¬(n.val ≤ 0) → (0 ≤ (n.val - 1)")), "{wf}");
+    }
+
+    #[test]
+    fn a_right_operand_without_partial_operations_changes_nothing() {
+        let l = lowered("djinn! { pub rel f(a: i64, b: i64) -> r: i64 { r == if a > 0 && b > 0 { 1 } else { 0 }; } }");
+        assert!(l[0].wf.is_empty(), "{:?}", l[0].wf);
     }
 
     fn spec_of(src: &str) -> String {

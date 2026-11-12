@@ -1646,8 +1646,19 @@ impl<'a> L<'a> {
             ExprKind::Bool(true) => "true".into(),
             ExprKind::Bool(false) => "false".into(),
             ExprKind::Not(x) => format!("!({})", self.prop(x)?),
-            ExprKind::Bin(BinOp::And, l, r) => format!("({} && {})", self.prop(l)?, self.prop(r)?),
-            ExprKind::Bin(BinOp::Or, l, r) => format!("({} || {})", self.prop(l)?, self.prop(r)?),
+            // the right operand is read under the left's truth (resp. falsity), as Rust's
+            // short-circuit operators are: its partial operations need only be defined there
+            ExprKind::Bin(op @ (BinOp::And | BinOp::Or), l, r) => {
+                let lp = self.prop(l)?;
+                let pending = std::mem::take(&mut self.guards);
+                self.cx.push(Cx::Guard(if *op == BinOp::And { lp.clone() } else { format!("!({lp})") }));
+                let rr = self.prop(r);
+                self.flush_guards();
+                self.cx.pop();
+                self.guards = pending;
+                let rp = rr?;
+                if *op == BinOp::And { format!("({lp} && {rp})") } else { format!("({lp} || {rp})") }
+            }
             ExprKind::Bin(op, l, r) if matches!(op, BinOp::Eq | BinOp::Ne) && (is_proplike(l) || is_proplike(r)) => {
                 let (bside, pside) = if is_proplike(r) { (l, r) } else { (r, l) };
                 let bp = self.prop(bside)?;
@@ -2573,6 +2584,14 @@ mod tests {
 
     fn find<'a>(l: &'a [crate::lower::Lowered], n: &str) -> &'a crate::lower::Lowered {
         l.iter().find(|d| d.name == n).unwrap()
+    }
+
+    #[test]
+    fn short_circuit_guards_the_right_operand_in_a_value_if() {
+        let l = lowered("djinn! { pub rel f(s: &[u8], n: i64) -> r: i64 { r == if n > 0 && s[n - 1] == 61 { n - 1 } else { n }; } }");
+        assert!(l[0].wf.iter().any(|w| w.starts_with("((n as int) > 0 ==> (0 <= ((n as int) - 1)")), "{:?}", l[0].wf);
+        let l = lowered("djinn! { pub rel g(s: &[u8], n: i64) -> r: i64 { r == if n <= 0 || s[n - 1] == 61 { n } else { 0 }; } }");
+        assert!(l[0].wf.iter().any(|w| w.starts_with("(!((n as int) <= 0) ==> (0 <= ((n as int) - 1)")), "{:?}", l[0].wf);
     }
 
     #[test]

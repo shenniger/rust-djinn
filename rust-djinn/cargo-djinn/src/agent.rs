@@ -94,13 +94,96 @@ pub fn shell_words(s: &str) -> Vec<String> {
 pub const ALLOWED_TOOLS: &[&str] = &[
     "Read", "Edit", "MultiEdit", "Write", "Glob", "Grep", "LS",
     "mcp__djinn__verify", "mcp__djinn__status",
-    "Bash(./verify*)", "Bash(./status*)", "Bash(./bench*)", "Bash(./verus-check*)",
+    "Bash(./verify*)", "Bash(./status*)", "Bash(./bench*)", "Bash(./verus-check*)", "Bash(./tools/*)", "Bash(tools/*)", "Bash(./newtools/*)", "Bash(newtools/*)",
     "Bash(lake *)", "Bash(lake)", "Bash(cd *)", "Bash(timeout *)",
     "Bash(cargo build*)", "Bash(cargo check*)", "Bash(cargo test*)", "Bash(cargo clippy*)", "Bash(cargo run*)", "Bash(cargo bench*)",
     "Bash(cat *)", "Bash(ls*)", "Bash(grep *)", "Bash(rg *)", "Bash(head *)", "Bash(tail *)", "Bash(wc *)", "Bash(find *)",
     "Bash(sed *)", "Bash(awk *)", "Bash(diff *)", "Bash(sort *)", "Bash(uniq *)", "Bash(echo *)", "Bash(python3 *)", "Bash(cp *)", "Bash(mv *)", "Bash(mkdir *)",
 ];
 
+/// `DJINN_NO_LOCAL_RUNS=1` (set by the fleet's optimize lanes): the agent runs nothing of its own
+/// on this machine. It edits, compiles (`cargo build`/`check`), verifies and measures through the
+/// fleet (`./bench`, `./tools/profile`); running the crate's code or any program it writes (the
+/// runner, examples, tests, `python3`, `timeout`, `perf`, its `newtools/`) is denied, and a tool it
+/// lacks is asked for with `./tools/request-tool`. Implement runs (Codex) are unaffected.
+pub fn no_local_runs() -> bool {
+    std::env::var("DJINN_NO_LOCAL_RUNS").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+}
+
+/// The Claude Code tools under `DJINN_NO_LOCAL_RUNS`.
+pub const NO_LOCAL_RUNS_TOOLS: &[&str] = &[
+    "Read", "Edit", "MultiEdit", "Write", "Glob", "Grep", "LS",
+    "mcp__djinn__verify", "mcp__djinn__status",
+    "Bash(./verify*)", "Bash(./status*)", "Bash(./bench*)", "Bash(./verus-check*)",
+    "Bash(./tools/profile*)", "Bash(tools/profile*)", "Bash(./tools/request-tool*)", "Bash(tools/request-tool*)",
+    // exact: the toolbox's waiter, not any other name that starts with these letters
+    "Bash(./tools/wait)", "Bash(./tools/wait *)", "Bash(tools/wait)", "Bash(tools/wait *)",
+    "Bash(lake build*)", "Bash(lake env lean *)", "Bash(cd *)",
+    "Bash(cargo build*)", "Bash(cargo check*)", "Bash(cargo clippy*)", "Bash(cargo rustc*)",
+    "Bash(objdump *)", "Bash(nm *)",
+    "Bash(cat *)", "Bash(ls*)", "Bash(grep *)", "Bash(head *)", "Bash(tail *)", "Bash(wc *)", "Bash(find *)",
+    "Bash(awk *)", "Bash(diff *)", "Bash(sort *)", "Bash(uniq *)", "Bash(echo *)", "Bash(cp *)", "Bash(mv *)", "Bash(mkdir *)",
+];
+
+/// Denied outright under `DJINN_NO_LOCAL_RUNS` (deny rules win over every allow, Claude Code's
+/// built-in ones included): the ways to run code here.
+pub const NO_LOCAL_RUNS_DENIED: &[&str] = &[
+    "Bash(cargo run*)", "Bash(cargo test*)", "Bash(cargo bench*)", "Bash(cargo nextest*)", "Bash(cargo miri*)",
+    "Bash(python*)", "Bash(pypy*)", "Bash(perl *)", "Bash(ruby *)", "Bash(node *)",
+    "Bash(timeout *)", "Bash(taskset *)", "Bash(nice *)", "Bash(time *)", "Bash(env *)", "Bash(xargs *)",
+    // not a way to run code, but Claude Code lets it through unasked: waiting is `./tools/wait`'s
+    "Bash(sleep)", "Bash(sleep *)",
+    "Bash(perf *)", "Bash(valgrind *)", "Bash(gdb *)", "Bash(strace *)", "Bash(ltrace *)", "Bash(hyperfine *)",
+    "Bash(bash *)", "Bash(sh *)", "Bash(zsh *)", "Bash(exec *)", "Bash(source *)",
+    "Bash(./target/*)", "Bash(target/*)", "Bash(./newtools/*)", "Bash(newtools/*)",
+    "Bash(lake exe*)", "Bash(lake env ./*)", "Bash(lake env /*)",
+    // run programs through options: `sed 'e CMD'`, `rg --pre CMD`, `sort --compress-program=CMD`
+    // (the Read, Grep and Edit tools do what they are for here)
+    "Bash(sed *)", "Bash(rg *)", "Bash(sort *--compress-program*)",
+];
+
+/// The allowed tools of this run, and the denied ones (empty unless `DJINN_NO_LOCAL_RUNS`).
+pub fn allowed_tools() -> (Vec<&'static str>, Vec<&'static str>) {
+    allowed_tools_for(no_local_runs())
+}
+
+pub fn allowed_tools_for(no_runs: bool) -> (Vec<&'static str>, Vec<&'static str>) {
+    if no_runs {
+        (NO_LOCAL_RUNS_TOOLS.to_vec(), NO_LOCAL_RUNS_DENIED.to_vec())
+    } else {
+        (ALLOWED_TOOLS.to_vec(), Vec::new())
+    }
+}
+
+/// Claude Code's permission arguments for a jail.
+fn claude_permission_args(jail: &Path, yolo: bool, no_runs: bool) -> Vec<String> {
+    let s = |x: &str| x.to_string();
+    let mut a = Vec::new();
+    if yolo && no_runs {
+        eprintln!("DJINN_NO_LOCAL_RUNS: --yolo ignored (the permission list is the ban)");
+    }
+    if yolo && !no_runs {
+        a.push(s("--dangerously-skip-permissions"));
+        return a;
+    }
+    let (allowed, denied) = allowed_tools_for(no_runs);
+    a.extend([s("--permission-mode"), s("acceptEdits"), s("--allowedTools")]);
+    a.extend(allowed.iter().map(|t| s(t)));
+    // the jail scripts, when the agent spells them with an absolute path
+    let scripts: &[&str] = if no_runs { &["verify", "status", "bench", "verus-check", "tools/profile", "tools/request-tool"] } else { &["verify", "status", "bench"] };
+    for sc in scripts {
+        a.push(format!("Bash({}/{sc}*)", jail.display()));
+    }
+    if no_runs {
+        a.push(format!("Bash({}/tools/wait)", jail.display()));
+        a.push(format!("Bash({}/tools/wait *)", jail.display()));
+    }
+    if !denied.is_empty() {
+        a.push(s("--disallowedTools"));
+        a.extend(denied.iter().map(|t| s(t)));
+    }
+    a
+}
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -419,16 +502,7 @@ fn agent_argv(opts: &Opts, jail: &Path, bin: &Path, manifest: &Path) -> Vec<Stri
                 s("--permission-prompts"),
                 s("none"),
             ];
-            if opts.yolo {
-                a.push(s("--dangerously-skip-permissions"));
-            } else {
-                a.extend([s("--permission-mode"), s("acceptEdits"), s("--allowedTools")]);
-                a.extend(ALLOWED_TOOLS.iter().map(|t| s(t)));
-                // the jail scripts, when the agent spells them with an absolute path
-                for sc in ["verify", "status", "bench"] {
-                    a.push(format!("Bash({}/{sc}*)", jail.display()));
-                }
-            }
+            a.extend(claude_permission_args(jail, opts.yolo, no_local_runs()));
             if let Some(m) = &opts.model {
                 a.extend([s("--model"), m.clone()]);
             }
@@ -477,9 +551,10 @@ fn agent_argv(opts: &Opts, jail: &Path, bin: &Path, manifest: &Path) -> Vec<Stri
                 s("approval_policy=\"never\""),
                 s("-c"),
                 s("mcp_servers.djinn.default_tools_approval_mode=\"auto\""),
-                // a verify runs Charon, Aeneas and lake: well over Codex's default tool timeout
+                // a verify runs Charon, Aeneas and lake: well over Codex's default tool timeout; a full
+                // gate of the big drop-ins (WebP) takes ~40 min, so 1800 s cut it off (2026-11-07): 2 h
                 s("-c"),
-                s("mcp_servers.djinn.tool_timeout_sec=1800"),
+                s("mcp_servers.djinn.tool_timeout_sec=7200"),
             ];
             if opts.yolo {
                 a.push(s("--dangerously-bypass-approvals-and-sandbox"));
@@ -560,7 +635,15 @@ pub fn implement(cfg: &Config, opts: Opts, bin: &Path) -> Result<bool, String> {
     // make sure the trusted side is current (merging stubs for new
     // obligations into an existing Proofs.lean), and try to populate Code/
     let mut log = Log::new(true);
-    verify::translate(cfg, &mut log)?;
+    // a solution the translation rejects (Rust Aeneas cannot model, left by an earlier run) is the agent's to fix, not a reason
+    // to stop before it starts (2026-11-11: the WebP decoder's run could never resume): say so and hand the failure on
+    let translate_failure = match verify::translate(cfg, &mut log) {
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("== the translation failed; the agent starts from that failure:\n{e}");
+            Some(e)
+        }
+    };
     // existing work: an implemented function, or a proof that is more than the
     // skeleton's `sorry` (the skeleton itself always exists after `translate`)
     let proofs_started = verify::proofs_started(cfg);
@@ -601,7 +684,13 @@ pub fn implement(cfg: &Config, opts: Opts, bin: &Path) -> Result<bool, String> {
     let started = now();
     let id = format!("{}-{}", id_time(started), opts.agent.name());
     let jail = crate::jail::create(cfg, &id, bin)?;
-    let prompt = task_prompt(cfg, opts.extra_prompt.as_deref(), existing_status.as_deref());
+    let extra = match (&translate_failure, opts.extra_prompt.as_deref()) {
+        (Some(e), x) => Some(format!("{}FIRST: the translation of the current solution fails, so nothing can be verified until it passes. \
+Rewrite the offending Rust into what Aeneas models (for example: no `?` operator, no trait-dispatched operators it lacks; plain `match`/`if let` on \
+Option instead), then continue. The failure:\n{e}", x.map(|x| format!("{x}\n\n")).unwrap_or_default())),
+        (None, x) => x.map(str::to_string),
+    };
+    let prompt = task_prompt(cfg, extra.as_deref(), existing_status.as_deref());
     fs::write(jail.join("PROMPT.md"), &prompt).map_err(|e| e.to_string())?;
     let argv = agent_argv(&opts, &jail, bin, &cfg.crate_dir.join("Cargo.toml"));
     let log_path = jail.join("agent.log");
@@ -883,4 +972,65 @@ pub fn run_foreground(cfg: &Config, opts: &Opts, prompt: &str, bin: &Path, stop:
     let _ = mon.join();
     let usage = status::summarize_log(&log_path, job.model.as_deref());
     Ok(AgentRun { job, exit_ok, interrupted, usage })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_local_runs_removes_every_way_to_run_code() {
+        let (allowed, denied) = allowed_tools_for(true);
+        for banned in ["Bash(cargo run*)", "Bash(cargo test*)", "Bash(cargo bench*)", "Bash(python3 *)", "Bash(timeout *)", "Bash(./newtools/*)", "Bash(newtools/*)", "Bash(./tools/*)", "Bash(tools/*)", "Bash(lake *)"] {
+            assert!(!allowed.contains(&banned), "{banned} is still allowed");
+        }
+        for d in ["Bash(cargo run*)", "Bash(cargo test*)", "Bash(cargo bench*)", "Bash(python*)", "Bash(timeout *)", "Bash(perf *)", "Bash(./target/*)", "Bash(./newtools/*)"] {
+            assert!(denied.contains(&d), "{d} is not denied");
+        }
+        for ok in ["Bash(./verify*)", "Bash(./status*)", "Bash(./bench*)", "Bash(./tools/profile*)", "Bash(./tools/request-tool*)", "Bash(cargo build*)", "Bash(cargo check*)", "Bash(lake build*)", "mcp__djinn__verify", "Read", "Edit"] {
+            assert!(allowed.contains(&ok), "{ok} is not allowed");
+        }
+        // nothing is both allowed and denied
+        assert!(allowed.iter().all(|a| !denied.contains(a)));
+    }
+
+    #[test]
+    fn the_waiter_is_allowed_by_exact_name_and_sleeping_is_not() {
+        let (allowed, denied) = allowed_tools_for(true);
+        for ok in ["Bash(./tools/wait)", "Bash(./tools/wait *)", "Bash(tools/wait)", "Bash(tools/wait *)"] {
+            assert!(allowed.contains(&ok), "{ok} is not allowed");
+            assert!(!denied.contains(&ok), "{ok} is denied");
+        }
+        // no prefix that would also run `./tools/wait-something` written by the agent
+        assert!(!allowed.iter().any(|t| t.starts_with("Bash(./tools/wait*") || t.starts_with("Bash(tools/wait*")));
+        assert!(!allowed.iter().any(|t| t.starts_with("Bash(sleep")));
+        assert!(denied.contains(&"Bash(sleep *)") && denied.contains(&"Bash(sleep)"));
+        assert!(denied.contains(&"Bash(timeout *)"));
+    }
+
+    #[test]
+    fn without_the_ban_the_list_is_unchanged() {
+        let (allowed, denied) = allowed_tools_for(false);
+        assert_eq!(allowed, ALLOWED_TOOLS.to_vec());
+        assert!(denied.is_empty());
+        let a = claude_permission_args(Path::new("/j"), false, false);
+        assert!(!a.contains(&"--disallowedTools".to_string()));
+        assert!(a.contains(&"Bash(/j/bench*)".to_string()));
+        assert_eq!(claude_permission_args(Path::new("/j"), true, false), vec!["--dangerously-skip-permissions".to_string()]);
+    }
+
+    #[test]
+    fn the_ban_holds_against_yolo_and_lists_the_fleet_tools() {
+        let a = claude_permission_args(Path::new("/j"), true, true);
+        assert!(!a.contains(&"--dangerously-skip-permissions".to_string()));
+        let i = a.iter().position(|x| x == "--permission-mode").unwrap();
+        assert_eq!(a[i + 1], "acceptEdits");
+        assert!(a.contains(&"Bash(/j/tools/profile*)".to_string()));
+        assert!(a.contains(&"Bash(/j/tools/request-tool*)".to_string()));
+        assert!(a.contains(&"Bash(/j/tools/wait *)".to_string()));
+        assert!(!a.iter().any(|x| x.starts_with("Bash(/j/tools/wait*")));
+        let d = a.iter().position(|x| x == "--disallowedTools").unwrap();
+        assert!(a[d + 1..].contains(&"Bash(cargo run*)".to_string()));
+        assert!(!a[..d].contains(&"Bash(cargo run*)".to_string()));
+    }
 }

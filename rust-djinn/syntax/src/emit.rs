@@ -512,7 +512,8 @@ pub fn obligations_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
     s.push_str("    helpers, but cannot weaken it: if the type does not match, this file fails\n");
     s.push_str("    to elaborate. `Audit.lean` then checks every theorem here, outside the\n");
     s.push_str("    reach of `Proofs`: its statement against `Statements.lean`, its proof in\n");
-    s.push_str("    the kernel, its axioms against {propext, Classical.choice, Quot.sound}. -/\n");
+    s.push_str("    the kernel, its axioms against {propext, Classical.choice, Quot.sound,\n");
+    s.push_str("    Djinn.Vocab.platform_64 (the 64-bit target)}. -/\n");
     s.push_str(&format!("import {0}.Spec\n{1}import {0}.Proofs\n\nopen Aeneas Std\nopen {0}.Spec\n\nset_option maxHeartbeats 1000000\n\nnamespace {0}.Obligations\n\n", cx.ns, code_import(cx)));
     s.push_str(&obligation_decls(cx, decls, false));
     s.push_str(&format!("end {}.Obligations\n", cx.ns));
@@ -603,7 +604,7 @@ fn name_term(dotted: &str) -> String {
 /// - the theorem is declared by `Obligations.lean` and states exactly what
 ///   `Statements.lean` (elaborated without `Proofs`) states;
 /// - its axioms, collected from the constants themselves, are among
-///   propext, Classical.choice and Quot.sound (by exact name);
+///   propext, Classical.choice, Quot.sound and Djinn.Vocab.platform_64 (by exact name);
 /// - the kernel accepts again every constant of this package's modules the
 ///   obligations reach (replayed onto the trusted imports alone: a
 ///   declaration added past the kernel, `debug.skipKernelTC` say, fails).
@@ -622,7 +623,7 @@ const AUDIT_TEMPLATE: &str = r#"/-  Audit.lean — generated; `cargo djinn verif
     only `Lean` and reads the built modules as data, so nothing `Proofs`
     defines takes part. Per obligation: declared by
     `Obligations.lean` with the statement `Statements.lean` elaborates without
-    `Proofs`; only propext, Classical.choice and Quot.sound as axioms; and
+    `Proofs`; only propext, Classical.choice, Quot.sound and Djinn.Vocab.platform_64 as axioms; and
     every constant of this package it reaches checked again by the kernel. -/
 import Lean
 open Lean
@@ -638,7 +639,7 @@ def reference : Name := @REFERENCE@
 def obligations : Array Name := #[
 @OBLIGATIONS@]
 
-def allowed : Array Name := #[nm ["propext"], nm ["Classical", "choice"], nm ["Quot", "sound"]]
+def allowed : Array Name := #[nm ["propext"], nm ["Classical", "choice"], nm ["Quot", "sound"], nm ["Djinn", "Vocab", "platform_64"]]
 
 abbrev EnvM := ReaderT Environment Id
 
@@ -860,6 +861,14 @@ theorem Aeneas.Std.WP.spec_equiv_exists {α : Type _} (m : Result α) (P : WP.Po
     exact (WP.spec_ok y).mpr hp
 
 namespace Djinn.Vocab
+
+/-- The target is 64-bit: `usize`/`isize` have 64 bits. Lean leaves `System.Platform.numBits` opaque (32 or 64), so
+    this is an axiom, the one the audit allows besides Lean's three (user, 2026-11-07: the drop-ins replace x86_64
+    libraries, and libwebp's limits there need buffers of 2^32 bytes and more). -/
+axiom platform_64 : System.Platform.numBits = 64
+
+theorem usize_numBits : UScalarTy.Usize.numBits = 64 := by simp [UScalarTy.numBits, platform_64]
+theorem isize_numBits : IScalarTy.Isize.numBits = 64 := by simp [IScalarTy.numBits, platform_64]
 
 /-- The bytes of a Rust `String`: its UTF-8 encoding. This is the view the
     specification gives a `String`, the same as a `&str`'s. -/

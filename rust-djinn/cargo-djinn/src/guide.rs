@@ -105,8 +105,9 @@ Call the `verify` tool (MCP server `djinn`) or run `./verify`. It:
 5. regenerates `Spec.lean`, `Obligations.lean`, `Statements.lean`, `Audit.lean`, this guide;
 6. `lake build` — your `Proofs.lean` must elaborate and each
    `{ns}.Proofs.<obligation>` must have the pinned type;
-7. axiom audit — only `propext`, `Classical.choice`, `Quot.sound` are
-   accepted. `sorry`, `axiom`, `native_decide`, `partial`, `implemented_by`
+7. axiom audit — only `propext`, `Classical.choice`, `Quot.sound` and
+   `Djinn.Vocab.platform_64` (the 64-bit target: `System.Platform.numBits = 64`;
+   `Djinn.Vocab.usize_numBits` / `isize_numBits` restate it) are accepted. `sorry`, `axiom`, `native_decide`, `partial`, `implemented_by`
    all fail here.
 
 It prints `PASS` or `FAIL: <stage>` with the errors (`SPECIFICATION VERIFIED`,

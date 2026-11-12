@@ -1281,6 +1281,28 @@ fn sync_lake_files(cfg: &Config, log: &mut Log) -> Result<(), String> {
     Ok(())
 }
 
+/// Charon or Aeneas with a memory limit (`DJINN_TOOL_MEM_GB`, default 40; 0: none) that dies with
+/// its parent: a run that blows up fails on its own, and none outlives the verify that started it.
+fn guarded_tool(tool: &str) -> Command {
+    let gb: u64 = std::env::var("DJINN_TOOL_MEM_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    if gb == 0 {
+        return Command::new(tool);
+    }
+    // real memory in a cgroup, not address space (`prlimit --as` stops runtimes that reserve
+    // large thread stacks); `setpriv --pdeathsig` ends it with its parent
+    // no user session bus (an MCP server started by an agent's sandbox): the run's own cgroup,
+    // when the wrapper set one, still bounds it, and the tool still dies with its parent
+    let bus = std::env::var_os("XDG_RUNTIME_DIR").map(|d| std::path::Path::new(&d).join("bus").exists()).unwrap_or(false);
+    if !bus {
+        let mut c = Command::new("setpriv");
+        c.args(["--pdeathsig", "KILL"]).arg(tool);
+        return c;
+    }
+    let mut c = Command::new("systemd-run");
+    c.args(["--user", "--scope", "-q", "-p"]).arg(format!("MemoryMax={gb}G")).args(["-p", "MemorySwapMax=0", "setpriv", "--pdeathsig", "KILL"]).arg(tool);
+    c
+}
+
 pub(crate) fn run(cmd: &mut Command, what: &str, log: &mut Log) -> Result<String, String> {
     log.line(&format!("== {what}"));
     let out = cmd.output().map_err(|e| format!("{what}: cannot run: {e}"))?;
@@ -1377,7 +1399,7 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
     // Charon's intermediate output belongs to the disposable state, not the crate root
     let _ = fs::create_dir_all(cfg.state_dir());
     let llbc = cfg.state_dir().join(format!("{}.llbc", cfg.crate_name));
-    let mut charon = Command::new(&cfg.charon);
+    let mut charon = guarded_tool(&cfg.charon);
     charon.args(["cargo", "--preset=aeneas", "--dest-file"]).arg(&llbc).env("DJINN_VERIFYING", "1").current_dir(&cfg.crate_dir);
     // the verified program is what the specification names: translation
     // starts from the `fn` stubs and follows their calls (the solution and its
@@ -1422,7 +1444,7 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
     let _ = fs::remove_dir_all(&code_dir);
     let _ = fs::remove_file(types_record_path(cfg));
     run(
-        Command::new(&cfg.aeneas)
+        guarded_tool(&cfg.aeneas)
             .args(["-backend", "lean"])
             .arg(&llbc)
             .arg("-dest")

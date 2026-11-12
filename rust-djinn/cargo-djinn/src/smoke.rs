@@ -1489,6 +1489,10 @@ impl<'a> Lo<'a> {
                 self.guard(format!("(and (<= 0 {}) (<= {} {}) (<= {} {n}))", a.s(), a.s(), b.s(), b.s()), "slice bounds".into());
                 match (a.lit(), b.lit()) {
                     (Some(x), Some(y)) if 0 <= x && x <= y && y <= n => Val::Seq(elems[x as usize..y as usize].to_vec()),
+                    // concrete bounds that do not fit this input (issue #2: smoke-test tries every length up to --max-len,
+                    // also those a `requires` excludes, so `s[1..]` at length 0 is `1..0`): the guard above already owes
+                    // `slice bounds` here, so the value is arbitrary; an empty sequence keeps the check instead of dropping it
+                    (Some(_), Some(_)) => Val::Seq(Vec::new()),
                     _ => return Err("slicing with symbolic bounds is not supported by smoke-test".into()),
                 }
             }
