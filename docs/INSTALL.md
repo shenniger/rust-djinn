@@ -65,6 +65,14 @@ example ships verified and its verification report is in place.
 
 ## 2. Aeneas and the other dependencies
 
+### Which backend?
+
+Currently, Aeneas/Lean is the default (and more mature) backend. It uses Aeneas
+to translate Rust code to a model and Lean to prove that the code satisfies your
+specification. Support for Verus (`--backend verus`, part 2b) is experimental.
+It verifies Rust directly with an SMT solver. If you're not sure which one to
+use, stick to Lean/Aeneas.
+
 Djinn needs tools to prove things about Rust code: Charon turns the crates
 into an intermediate form, Aeneas turns that into Lean, and Lean checks the
 proofs against the Mathlib-based Aeneas library. The tools expect all three
@@ -169,6 +177,12 @@ nothing but lose to the metadata: `DJINN_CHARON`, `DJINN_AENEAS`,
 `DJINN_AENEAS_LEAN`, `DJINN_LAKE_PACKAGES`. Setting the three tool variables
 in your shell profile lets a new crate's metadata hold only `namespace`.
 
+Charon and Aeneas run in a scope capped at `DJINN_TOOL_MEM_GB` gigabytes of real
+memory (default 40; `0` turns the cap off) that ends with the `verify` that started
+them, so a run that blows up fails on its own. The cap needs a user session bus
+(`systemd-run --user`); without one, as inside an agent's sandbox, the tools still
+die with their parent but are not capped.
+
 ### Checking the installation
 
 ```sh
@@ -203,7 +217,9 @@ directory holding the `verus` binary (with `rust_verify`, `z3`,
 `tools/verus/verus` is what the examples point at. The release pins a Rust
 toolchain (`version.json` names it, e.g. `1.99.1-x86_64-unknown-linux-gnu`);
 `verus` installs it through `rustup` on first use, so `rustup` (and so
-`~/.cargo/bin`) must be on `PATH`. Check:
+`~/.cargo/bin`) must be on `PATH`. Leave that toolchain installed afterwards:
+`rustup` does not show it as in use, and without it every Verus verify fails.
+Check:
 
 ```sh
 tools/verus/verus --version
@@ -290,6 +306,11 @@ codex exec 'say ok'
 ```
 
 Codex is the default; pick per run with `--agent codex` or `--agent claude`.
+`DJINN_NO_LOCAL_RUNS=1` restricts a Claude Code agent to editing, compiling
+(`cargo build`, `cargo check`) and verifying: it may not run the crate's code,
+its tests or benchmarks, or programs of its own on this machine (for setups that
+measure elsewhere; it also overrides `--yolo`). The jail's `CLAUDE.md` says so.
+Codex runs are not restricted by it.
 The editor plugins use the `djinn.agent` setting or the `AGENT` variable at the
 top of the Neovim config, both `codex` by default.
 

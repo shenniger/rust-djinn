@@ -336,6 +336,34 @@ The agent gets a Verus guide (`cargo djinn guide --backend verus`,
 `GUIDE.md` in the jail), a `./verus-check` script that runs Verus on its copy
 without syncing, and the usual `verify`/`status`/`bench`.
 
+## Working with it
+
+What cost the most time in our runs on real libraries, and what helped:
+
+- **Existential witnesses.** An obligation that asks for a witness holding a
+  `Vec` (a parse, a suffix of the input) cannot be built in ghost code: `vstd`
+  has no ghost `Vec` construction, so the witness is an exec value. Witnesses
+  built inline in a loop made parsers quadratic. Build each one in its own small
+  function from a non-escaping local and return only `Ghost<…>`: nothing exec
+  reads it, and the compiler removes the allocation and the copy (confirm with
+  `--emit=asm`). `Vec::with_capacity` plus `extend_from_slice` is not removed,
+  because the growth call takes the vector by reference.
+- **Z3.** Two identical formulas at different places are different terms to the
+  solver, so a fact established at one site does not fire at another; `choose`
+  does not fire when its trigger sits in a branch that is not taken; trigger
+  loops and deep specifications exhaust the resource limit (`#[verifier::rlimit]`)
+  or memory. Splitting long functions and restating the needed fact with
+  `assert` at the use site were the usual repairs.
+- **Verdicts can move.** A proof near the resource limit may pass on one run and
+  fail on the next, or on another machine; a restored solution that no longer
+  verifies is a real outcome. Leave headroom below the limit.
+- **Parallel agents by area** (header parsing, frames, filters) worked well, since
+  each area's pinned wrappers verify on their own.
+
+The Verus release pins a Rust toolchain of its own (`tools/verus/version.json`),
+which `rustup` does not show as in use. Leave it installed: without it every
+Verus verify fails, and so does restoring a run's checkpoint.
+
 ## Not supported by this backend
 
 The lowering refuses these with a message pointing at the construct; the Lean
@@ -368,4 +396,7 @@ relations' termination included); `example/strmap` (strings, a map, an
 ambient function) verifies end to end with a Verus solution;
 `example/clamp-verus` is `example/clamp` verified with this backend, and a
 `cargo djinn implement --agent claude` run on a copy of it produced a passing
-solution and proofs in under two minutes.
+solution and proofs in under two minutes. Outside this repository, agents
+reached `PASS` with this backend on reimplementations of liblz4 (416
+obligations), liblzma (1,020), libtiff (822) and libvpx's VP8 decoder (about
+1,400), and optimized the last two under it.

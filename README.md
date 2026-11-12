@@ -163,7 +163,9 @@ cargo build   compiles solution/mod.rs only if the verification report matches t
    `solution/mod.rs` and `Proofs.lean` (with `--backend verus`: the solution
    inside `verus! { … }` and `djinn/verus/src/proofs.rs`) until every
    obligation checks.
-4. `cargo djinn verify` has Lean (or Verus) check every obligation.
+4. `cargo djinn verify` has Lean (or Verus) check every obligation. With Lean it
+   also audits the axioms the proofs rest on: Lean's own three and
+   `Djinn.Vocab.platform_64`, the assumption that the target is 64-bit.
 5. `cargo djinn bench` and `cargo djinn optimize` time a workload and
    hill-climb on it under the verifier.
 6. `rust-djinn-lsp` shows the proof status after every function in VS Code and
